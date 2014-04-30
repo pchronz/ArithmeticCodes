@@ -1,4 +1,5 @@
-# TODO Grayscale images.
+# XXX Reimplement scaleboundaries, avoiding rounding, conversion and BigFloat.
+# XXX Implement decodewindow without recursion.
 # TODO Use generic functions to be flexible with the source alphabet.
 # TODO Single Gaussian probabilistic model.
 # TODO tests?
@@ -7,31 +8,37 @@
 # TODO Extend function names that manipulate parameters with an exclamation mark
 # TODO Re-use calculations. For example in the probabilistc model don't 
 #	recompute the whole model if not necessary, instead update it. Use as co-routine?!
-# XXX Why doesn't the algorithm work properly for 2x2?
 
 module arithmo4astro
 using Images
 using ImageView
+using Distributions
 
 abstract SourceIterator
 type TwoDIterator <: SourceIterator
 	w::Uint
 	h::Uint
 	done::Bool
+	overflow::Bool
 end
 function TwoDIterator(first=false)
 	if first
-		TwoDIterator(uint(1), uint(1), false)
+		TwoDIterator(uint(1), uint(1), false, false)
 	else
-		TwoDIterator(uint(0), uint(0), false)
+		TwoDIterator(uint(0), uint(0), false, false)
 	end
 end
 abstract DataSource
 type TwoDGreyImage <: DataSource
 	data::Array{Uint8, 2}
+	overflow::Vector{Uint8}
+end
+function TwoDGreyImage(data::Array{Uint8, 2})
+	TwoDGreyImage(data, Array(Uint8, 0))
 end
 function hor2diterator(src::TwoDGreyImage, iterator::TwoDIterator)
 	if iterator.done
+		iterator.overflow = true
 		return iterator
 	else
 		if iterator.w == 0 && iterator.h == 0
@@ -51,7 +58,11 @@ function hor2diterator(src::TwoDGreyImage, iterator::TwoDIterator)
 	end
 end
 function pushsymbol!(src::TwoDGreyImage, src_it::TwoDIterator, sym::Uint8)
-	src.data[src_it.h, src_it.w] = sym
+	if !src_it.overflow
+		src.data[src_it.h, src_it.w] = sym
+	else
+		push!(src.overflow, sym)
+	end
 end
 
 # encode the image pixel by pixel
@@ -113,7 +124,7 @@ function encode(src::DataSource, src_it_state::SourceIterator, src_it::Function,
 	assert(lowerend > lower)
 	assert(lowerend + (uint(1) << (64 - zeropos)) - 1 <= upper)
 	append!(encoded, collect(bits(lowerend)[1:zeropos]))
-	
+
 	encoded
 end
 
@@ -125,7 +136,7 @@ function calculateoverlap(lower::Uint64, upper::Uint64)
 	overlaplength
 end
 
-function decode!(encoded::Vector{Char}, src::DataSource, 
+function decode!(encoded::Vector{Char}, alphabet::Vector{Uint8}, src::DataSource, 
 	src_it_state::SourceIterator, src_it::Function, 
 	calculateboundaries::Function)
 	# Window that holds the open code symbols, until a new source symbol 
@@ -152,19 +163,19 @@ function decode!(encoded::Vector{Char}, src::DataSource,
 		window = window | (t << (64 - pos))
 		# Decode all source symbols using the codeword interval.
 		lower, upper, window, pos = decodewindow!(lower, upper, window, 
-			pos, src, src_it_state, src_it, calculateboundaries)
+			pos, alphabet, src, src_it_state, src_it, calculateboundaries)
 	end
 	src
 end
 
 function decodewindow!(lower::Uint64, upper::Uint64, window::Uint64, pos::Int,
-	src::DataSource, src_it_state::SourceIterator, src_it::Function,
-	calculateboundaries::Function)
+	alphabet::Vector{Uint8}, src::DataSource, src_it_state::SourceIterator, 
+	src_it::Function, calculateboundaries::Function)
 	# The upper boundary of the window interval.
 	# Since we cannot represent "1", we will compare as "<=" according to 
 		# our presicion instead of "<".
 	windowtop = window + (uint64(1) << (64 - pos)) - 1
-	for sym in [locol, hicol, EOF]
+	for sym in [collect(alphabet), EOF]
 		if sym == EOF
 			low, up = calculateboundaries(lower, upper, src)
 		else
@@ -172,6 +183,11 @@ function decodewindow!(lower::Uint64, upper::Uint64, window::Uint64, pos::Int,
 			low, up = calculateboundaries(lower, upper, src, 
 				src_it_state)
 		end
+		#info("sym -> \t$(sym)")
+		#info("low -> \t$(low)")
+		#info("window ->\t$(window)")
+		#info("wintop ->\t$(windowtop)")
+		#info("up -> \t$(up)")
 		# Test whether our window is within the symbol's interval
 		if low <= window && up >= windowtop
 			if sym == EOF
@@ -196,8 +212,8 @@ function decodewindow!(lower::Uint64, upper::Uint64, window::Uint64, pos::Int,
 			push!(lower_dec, low)
 			push!(upper_dec, up)
 
-			return decodewindow!(low, up, window, pos, src, 
-				src_it_state, src_it, calculateboundaries)
+			return decodewindow!(low, up, window, pos, alphabet,
+				src, src_it_state, src_it, calculateboundaries)
 		end
 	end
 	lower, upper, window, pos
@@ -212,6 +228,32 @@ function scaleboundaries(lower::Uint64, upper::Uint64, low::Float64,
 	lower, upper
 end
 
+# Static probability model for grayscale images.
+function calculateboundariesgraystatic(lower::Uint64, upper::Uint64, 
+	src::DataSource, it_state::SourceIterator)
+	# Get the most recent symbol.
+	sym::Uint8 = src.data[it_state.h, it_state.w]
+	
+	num_pixels = prod(size(src.data))
+	p_EOF = 1.0/float64(num_pixels + 1)
+	p_delta = 1.0/256.0 * (1.0 - p_EOF)
+	assert(p_delta*256 == 1.0 - p_EOF)
+
+	# Calculate the floating point boundaries.
+	low = float64(sym)*p_delta
+	up = float64(sym + 1)*p_delta
+	scaleboundaries(lower, upper, low, up)
+end
+# EOF version
+function calculateboundariesgraystatic(lower::Uint64, upper::Uint64, 
+	src::DataSource)
+	num_pixels = prod(size(src.data))
+	p_EOF = 1.0/float64(num_pixels + 1)
+	low = 1.0 - p_EOF
+	up = 1.0
+	scaleboundaries(lower, upper, low, up)
+end
+
 # Static probability model.
 function calculateboundariesstatic(lower::Uint64, upper::Uint64, 
 	src::DataSource, it_state::SourceIterator)
@@ -224,10 +266,10 @@ function calculateboundariesstatic(lower::Uint64, upper::Uint64,
 	p_hi = 1 - p_EOF - p_lo
 
 	# Calculate the floating point boundaries.
-	if sym == locol
+	if sym == 0
 		low = 0.0
 		up = p_lo
-	elseif sym == hicol
+	elseif sym == 255
 		low = p_lo
 		up = p_lo + p_hi
 	else
@@ -249,7 +291,12 @@ end
 function calculateboundarieslaplace(lower::Uint64, upper::Uint64, 
 	src::DataSource, it_state::SourceIterator)
 	# Get the most recent symbol.
-	sym::Uint8 = src.data[it_state.h, it_state.w]
+	sym::Uint8
+	if !it_state.overflow
+		sym = src.data[it_state.h, it_state.w]
+	else
+		sym = src.overflow[end]
+	end
 	img_w = size(src.data)[2]
 
 	num_pixels = prod(size(src.data))
@@ -268,10 +315,10 @@ function calculateboundarieslaplace(lower::Uint64, upper::Uint64,
 	p_lo = (1.0 - p_EOF) - p_hi
 
 	# Calculate the floating point boundaries.
-	if sym == locol
+	if sym == 0
 		low = 0.0
 		up = p_lo
-	elseif sym == hicol
+	elseif sym == 255
 		low = p_lo
 		up = 1.0 - p_EOF
 	else
@@ -290,12 +337,52 @@ function calculateboundarieslaplace(lower::Uint64, upper::Uint64,
 end
 
 # Test it.
-img_w = 100
-img_h = 100
+img_w = 50
+img_h = 50
 
-locol = 0
-hicol = 255
 EOF = "EOF"
+
+function testGrayscaleStatic()
+	info("Testing the static model on a binary image.")
+	# DEBUG
+	global lower_enc = Array(Uint64, 0)
+	global upper_enc = Array(Uint64, 0)
+	global lower_dec = Array(Uint64, 0)
+	global upper_dec = Array(Uint64, 0)
+
+	#img_64::Vector{Int} = rand(DiscreteUniform(0, 255), img_h*img_w)
+	img_64::Vector{Int} = rand(Binomial(256, 0.35), img_h*img_w)
+	img_8::Vector{Uint8} = map((x)->uint8(x), img_64)
+	img = Image(reshape(img_8, img_h, img_w))
+	ImageView.display(img)
+
+	tic()
+	# Static probabilistic model.
+	encoded = encode(TwoDGreyImage(img.data), TwoDIterator(), hor2diterator,
+		calculateboundariesgraystatic)
+	toc()
+	info("Encoded length: $(length(encoded))")
+
+	tic()
+	# Static probabilistic model.
+	decoded = decode!(encoded, Uint8[0:255], 
+		TwoDGreyImage(zeros(Uint8, size(img.data))), TwoDIterator(true),
+		hor2diterator, calculateboundariesgraystatic)
+	toc()
+	info("$(img_w*img_h - length(decoded.data)) pixels were missing")
+	img_decoded = Image(decoded.data)
+	ImageView.display(img_decoded)
+
+	# DEBUG
+	lower_comp = lower_enc[1:end - (length(lower_enc) - 
+		length(lower_dec))] .- lower_dec
+	upper_comp = upper_enc[1:end - (length(upper_enc) - 
+		length(upper_dec))] .- upper_dec
+	assert(sum(lower_comp) + sum(upper_comp) == 0)
+
+	assert(img.data == img_decoded.data)
+	info("Test done")
+end
 
 function testBinaryStatic()
 	info("Testing the static model on a binary image.")
@@ -305,8 +392,8 @@ function testBinaryStatic()
 	global lower_dec = Array(Uint64, 0)
 	global upper_dec = Array(Uint64, 0)
 
-	img = Image(ones(Uint8, img_w, img_h).*hicol)
-	img.data[:, 2] = locol
+	img = Image(ones(Uint8, img_w, img_h).*255)
+	img.data[:, 2] = 0
 	ImageView.display(img)
 
 	tic()
@@ -318,18 +405,15 @@ function testBinaryStatic()
 
 	tic()
 	# Static probabilistic model.
-	decoded = decode!(encoded, TwoDGreyImage(zeros(Uint8, size(img.data))), 
-		TwoDIterator(true), hor2diterator, calculateboundariesstatic)
+	decoded = decode!(encoded, Uint8[0, 255], 
+		   TwoDGreyImage(zeros(Uint8, size(img.data))), 
+		   TwoDIterator(true), hor2diterator, calculateboundariesstatic)
 	toc()
 	info("$(img_w*img_h - length(decoded.data)) pixels were missing")
 	img_decoded = Image(decoded.data)
 	ImageView.display(img_decoded)
 
 	# DEBUG
-	#info("length(lower_enc) -> $(length(lower_enc))")
-	#info("length(upper_enc) -> $(length(upper_enc))")
-	#info("length(lower_dec) -> $(length(lower_dec))")
-	#info("length(upper_dec) -> $(length(upper_dec))")
 	lower_comp = lower_enc[1:end - (length(lower_enc) - 
 		length(lower_dec))] .- lower_dec
 	upper_comp = upper_enc[1:end - (length(upper_enc) - 
@@ -348,8 +432,8 @@ function testBinaryLaplace()
 	global lower_dec = Array(Uint64, 0)
 	global upper_dec = Array(Uint64, 0)
 
-	img = Image(ones(Uint8, img_w, img_h).*hicol)
-	img.data[:, 2] = locol
+	img = Image(ones(Uint8, img_w, img_h).*0)
+	img.data[:, 2] = 255
 	ImageView.display(img)
 
 	tic()
@@ -361,18 +445,15 @@ function testBinaryLaplace()
 
 	tic()
 	# Laplace's rule of succession as adaptive model.
-	decoded = decode!(encoded, TwoDGreyImage(zeros(Uint8, size(img.data))), 
-		TwoDIterator(true), hor2diterator, calculateboundarieslaplace)
+	decoded = decode!(encoded, Uint8[0, 255], 
+		TwoDGreyImage(zeros(Uint8, size(img.data))), TwoDIterator(true), 
+		hor2diterator, calculateboundarieslaplace)
 	toc()
 	info("$(img_w*img_h - length(decoded.data)) pixels were missing")
 	img_decoded = Image(decoded.data)
 	ImageView.display(img_decoded)
 
 	# DEBUG
-	#info("length(lower_enc) -> $(length(lower_enc))")
-	#info("length(upper_enc) -> $(length(upper_enc))")
-	#info("length(lower_dec) -> $(length(lower_dec))")
-	#info("length(upper_dec) -> $(length(upper_dec))")
 	lower_comp = lower_enc[1:end - (length(lower_enc) - 
 		length(lower_dec))] .- lower_dec
 	upper_comp = upper_enc[1:end - (length(upper_enc) - 
@@ -385,6 +466,7 @@ end
 
 testBinaryStatic()
 testBinaryLaplace()
+testGrayscaleStatic()
 
 end
 
