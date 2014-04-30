@@ -163,7 +163,8 @@ function decode!(encoded::Vector{Char}, alphabet::Vector{Uint8}, src::DataSource
 		window = window | (t << (64 - pos))
 		# Decode all source symbols using the codeword interval.
 		lower, upper, window, pos = decodewindow!(lower, upper, window, 
-			pos, alphabet, src, src_it_state, src_it, calculateboundaries)
+			pos, alphabet, src, src_it_state, src_it, 
+			calculateboundaries)
 	end
 	src
 end
@@ -175,45 +176,60 @@ function decodewindow!(lower::Uint64, upper::Uint64, window::Uint64, pos::Int,
 	# Since we cannot represent "1", we will compare as "<=" according to 
 		# our presicion instead of "<".
 	windowtop = window + (uint64(1) << (64 - pos)) - 1
-	for sym in [collect(alphabet), EOF]
-		if sym == EOF
-			low, up = calculateboundaries(lower, upper, src)
-		else
-			pushsymbol!(src, src_it_state, uint8(sym))
-			low, up = calculateboundaries(lower, upper, src, 
-				src_it_state)
-		end
-		#info("sym -> \t$(sym)")
-		#info("low -> \t$(low)")
-		#info("window ->\t$(window)")
-		#info("wintop ->\t$(windowtop)")
-		#info("up -> \t$(up)")
-		# Test whether our window is within the symbol's interval
-		if low <= window && up >= windowtop
+	# Indicator whether the window fit into one of the symbol intervals
+	# in a particular iterator over all symbols.
+	found::Bool = true
+	while found
+		found = false
+		for sym in [collect(alphabet), EOF]
 			if sym == EOF
-				info("Reached EOF symbol.")
-				return lower, upper, window, pos
+				low, up = calculateboundaries(lower, upper, src)
+			else
+				pushsymbol!(src, src_it_state, uint8(sym))
+				low, up = calculateboundaries(lower, upper, src, 
+					src_it_state)
 			end
-			src_it_state = src_it(src, src_it_state)
-			# Identify the identical bits and shift them out.
-			overlaplength = calculateoverlap(low, up)
-			
-			# shift the boundaries to remove the written bits
-			low = low << overlaplength
-			up = up << overlaplength
-			window = window << overlaplength
-			pos -= overlaplength
-			assert(low < up)
-			assert(window >= low)
-			assert(window <= up)
-			assert(pos >= 0)
+			# Check whether the symbol interval encloses the window.
+			if low <= window && up >= windowtop
+				# If it is the EOF symbol, you're done.
+				if sym == EOF
+					info("Reached EOF symbol.")
+					return lower, upper, window, pos
+				end
+				# Otherwise the symbol is already in the target,
+				# and you need to increment the iterator, update
+				# the boundaries, and shift both.
 
-			# DEBUG
-			push!(lower_dec, low)
-			push!(upper_dec, up)
+				# Increment the iterator.
+				src_it_state = src_it(src, src_it_state)
 
-			return decodewindow!(low, up, window, pos, alphabet,
-				src, src_it_state, src_it, calculateboundaries)
+				# Shift the boundaries.
+				# Identify the identical bits and shift them out.
+				overlaplength = calculateoverlap(low, up)
+				# Shift the boundaries to remove the written bits
+				low = low << overlaplength
+				up = up << overlaplength
+				window = window << overlaplength
+				pos -= overlaplength
+				windowtop = window + (uint64(1) << (64 - pos)) - 1
+
+				# DEBUG
+				push!(lower_dec, low)
+				push!(upper_dec, up)
+
+				assert(low < up)
+				assert(window >= low)
+				assert(window <= up)
+				assert(pos >= 0)
+
+				# Update the boundaries.
+				lower = low
+				upper = up
+
+				# Signal that we need to go even deeper.
+				found = true
+				break
+			end
 		end
 	end
 	lower, upper, window, pos
