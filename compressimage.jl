@@ -71,8 +71,8 @@ function encode(src::DataSource, src_it_state::SourceIterator, src_it::Function,
 	# Encoded vector
 	encoded::Vector{Char} = Array(Char, 0)
 	# This vector counts the occurences of symbols.
-	lower::Uint64 = 0
-	upper::Uint64 = 0 - 1
+	lower::Uint32 = uint32(0)
+	upper::Uint32 = uint32(0) - uint32(1)
 	while !src_it_state.done
 		src_it_state = src_it(src, src_it_state)
 		lower, upper = calculateboundaries(lower, upper, src, 
@@ -120,15 +120,15 @@ function encode(src::DataSource, src_it_state::SourceIterator, src_it::Function,
 	zeropos = search(bits(lower), '0', zeropos + 1)
 	assert(zeropos > overlaplength)
 	# write out the overlapping bits
-	lowerend = lower + (uint64(1) << (64 - zeropos))
+	lowerend::Uint32 = lower + (uint32(1) << (32 - zeropos))
 	assert(lowerend > lower)
-	assert(lowerend + (uint(1) << (64 - zeropos)) - 1 <= upper)
+	assert(lowerend + (uint(1) << (32 - zeropos)) - 1 <= upper)
 	append!(encoded, collect(bits(lowerend)[1:zeropos]))
 
 	encoded
 end
 
-function calculateoverlap(lower::Uint64, upper::Uint64)
+function calculateoverlap(lower::Uint32, upper::Uint32)
 	# find out which bits are the same
 	samebits = ~(lower $ upper)
 	regmatch = match(r"(1*)(.*)$", bits(samebits))
@@ -141,16 +141,16 @@ function decode!(encoded::Vector{Char}, alphabet::Vector{Uint8}, src::DataSource
 	calculateboundaries::Function)
 	# Window that holds the open code symbols, until a new source symbol 
 		#is identified.
-	window::Uint64 = 0
+	window::Uint32 = 0
 	# Pointer to the current position in the interval window string
 	pos = 0
 	# Lower and upper boundaries for the symbols.
-	lower::Uint64 = 0
-	upper::Uint64 = 0 - 1
+	lower::Uint32 = 0
+	upper::Uint32 = 0 - 1
 	# Go through the target symbols
 	for tc in encoded
 		pos += 1
-		if pos > 64
+		if pos > 32
 			# TODO I think it should never happen that we enter this
 				# here. Prove it!
 			error("The decoding window is too small. The position in
@@ -158,9 +158,9 @@ function decode!(encoded::Vector{Char}, alphabet::Vector{Uint8}, src::DataSource
 				$(typeof(window))")
 		end
 		# Convert the target symbol to an integer
-		t = uint64(tc) - 48
+		t = uint32(tc) - 48
 		# Push the codeword symbol into the window
-		window = window | (t << (64 - pos))
+		window = window | (t << (32 - pos))
 		# Decode all source symbols using the codeword interval.
 		lower, upper, window, pos = decodewindow!(lower, upper, window, 
 			pos, alphabet, src, src_it_state, src_it, 
@@ -169,24 +169,26 @@ function decode!(encoded::Vector{Char}, alphabet::Vector{Uint8}, src::DataSource
 	src
 end
 
-function decodewindow!(lower::Uint64, upper::Uint64, window::Uint64, pos::Int,
+function decodewindow!(lower::Uint32, upper::Uint32, window::Uint32, pos::Int,
 	alphabet::Vector{Uint8}, src::DataSource, src_it_state::SourceIterator, 
 	src_it::Function, calculateboundaries::Function)
 	# The upper boundary of the window interval.
 	# Since we cannot represent "1", we will compare as "<=" according to 
 		# our presicion instead of "<".
-	windowtop = window + (uint64(1) << (64 - pos)) - 1
+	windowtop::Uint32 = window + (uint32(1) << (32 - pos)) - uint32(1)
 	# Indicator whether the window fit into one of the symbol intervals
 	# in a particular iterator over all symbols.
 	found::Bool = true
 	while found
 		found = false
 		for sym in [collect(alphabet), EOF]
+			low::Uint32
+			up::Uint32
 			if sym == EOF
 				low, up = calculateboundaries(lower, upper, src)
 			else
 				pushsymbol!(src, src_it_state, uint8(sym))
-				low, up = calculateboundaries(lower, upper, src, 
+				low, up = calculateboundaries(lower, upper, src,
 					src_it_state)
 			end
 			# Check whether the symbol interval encloses the window.
@@ -211,7 +213,7 @@ function decodewindow!(lower::Uint64, upper::Uint64, window::Uint64, pos::Int,
 				up = up << overlaplength
 				window = window << overlaplength
 				pos -= overlaplength
-				windowtop = window + (uint64(1) << (64 - pos)) - 1
+				windowtop = window + (uint32(1) << (32 - pos)) - uint32(1)
 
 				# DEBUG
 				push!(lower_dec, low)
@@ -235,17 +237,17 @@ function decodewindow!(lower::Uint64, upper::Uint64, window::Uint64, pos::Int,
 	lower, upper, window, pos
 end
 
-function scaleboundaries(lower::Uint64, upper::Uint64, low::Float64, 
+function scaleboundaries(lower::Uint32, upper::Uint32, low::Float64, 
 	up::Float64)
 	# scale the boundaries
-	p = upper - lower
-	upper = lower + uint64(round(BigFloat(p)*BigFloat(up))) - 1
-	lower = lower + uint64(round(BigFloat(p)*BigFloat(low)))
+	p::Uint32 = upper - lower
+	upper::Uint32 = uint32(lower) + uint32(round(float64(p)*float64(up))) - uint32(1)
+	lower::Uint32 = uint32(lower) + uint32(round(float64(p)*float64(low)))
 	lower, upper
 end
 
 # Static probability model for grayscale images.
-function calculateboundariesgraystatic(lower::Uint64, upper::Uint64, 
+function calculateboundariesgraystatic(lower::Uint32, upper::Uint32, 
 	src::DataSource, it_state::SourceIterator)
 	# Get the most recent symbol.
 	sym::Uint8 = src.data[it_state.h, it_state.w]
@@ -256,12 +258,12 @@ function calculateboundariesgraystatic(lower::Uint64, upper::Uint64,
 	assert(p_delta*256 == 1.0 - p_EOF)
 
 	# Calculate the floating point boundaries.
-	low = float64(sym)*p_delta
-	up = float64(sym + 1)*p_delta
+	low = sym*p_delta
+	up = (sym + 1)*p_delta
 	scaleboundaries(lower, upper, low, up)
 end
 # EOF version
-function calculateboundariesgraystatic(lower::Uint64, upper::Uint64, 
+function calculateboundariesgraystatic(lower::Uint32, upper::Uint32, 
 	src::DataSource)
 	num_pixels = prod(size(src.data))
 	p_EOF = 1.0/float64(num_pixels + 1)
@@ -271,7 +273,7 @@ function calculateboundariesgraystatic(lower::Uint64, upper::Uint64,
 end
 
 # Static probability model.
-function calculateboundariesstatic(lower::Uint64, upper::Uint64, 
+function calculateboundariesstatic(lower::Uint32, upper::Uint32, 
 	src::DataSource, it_state::SourceIterator)
 	# Get the most recent symbol.
 	sym::Uint8 = src.data[it_state.h, it_state.w]
@@ -294,7 +296,7 @@ function calculateboundariesstatic(lower::Uint64, upper::Uint64,
 	scaleboundaries(lower, upper, low, up)
 end
 # EOF version
-function calculateboundariesstatic(lower::Uint64, upper::Uint64, 
+function calculateboundariesstatic(lower::Uint32, upper::Uint32, 
 	src::DataSource)
 	num_pixels = prod(size(src.data))
 	p_EOF = 1.0/float64(num_pixels + 1)
@@ -304,7 +306,7 @@ function calculateboundariesstatic(lower::Uint64, upper::Uint64,
 end
 
 # Laplace's rule of succession as adaptive probabilit model.
-function calculateboundarieslaplace(lower::Uint64, upper::Uint64, 
+function calculateboundarieslaplace(lower::Uint32, upper::Uint32, 
 	src::DataSource, it_state::SourceIterator)
 	# Get the most recent symbol.
 	sym::Uint8
@@ -343,7 +345,7 @@ function calculateboundarieslaplace(lower::Uint64, upper::Uint64,
 	scaleboundaries(lower, upper, low, up)
 end
 # EOF version
-function calculateboundarieslaplace(lower::Uint64, upper::Uint64, 
+function calculateboundarieslaplace(lower::Uint32, upper::Uint32, 
 	src::DataSource)
 	num_pixels = prod(size(src.data))
 	p_EOF = 1.0/float64(num_pixels + 1)
@@ -361,13 +363,13 @@ EOF = "EOF"
 function testGrayscaleStatic()
 	info("Testing the static model on a binary image.")
 	# DEBUG
-	global lower_enc = Array(Uint64, 0)
-	global upper_enc = Array(Uint64, 0)
-	global lower_dec = Array(Uint64, 0)
-	global upper_dec = Array(Uint64, 0)
+	global lower_enc = Array(Uint32, 0)
+	global upper_enc = Array(Uint32, 0)
+	global lower_dec = Array(Uint32, 0)
+	global upper_dec = Array(Uint32, 0)
 
 	#img_64::Vector{Int} = rand(DiscreteUniform(0, 255), img_h*img_w)
-	img_64::Vector{Int} = rand(Binomial(256, 0.35), img_h*img_w)
+	img_64::Vector{Int} = rand(Binomial(256, 0.01), img_h*img_w) - 1
 	img_8::Vector{Uint8} = map((x)->uint8(x), img_64)
 	img = Image(reshape(img_8, img_h, img_w))
 	ImageView.display(img)
@@ -403,10 +405,10 @@ end
 function testBinaryStatic()
 	info("Testing the static model on a binary image.")
 	# DEBUG
-	global lower_enc = Array(Uint64, 0)
-	global upper_enc = Array(Uint64, 0)
-	global lower_dec = Array(Uint64, 0)
-	global upper_dec = Array(Uint64, 0)
+	global lower_enc = Array(Uint32, 0)
+	global upper_enc = Array(Uint32, 0)
+	global lower_dec = Array(Uint32, 0)
+	global upper_dec = Array(Uint32, 0)
 
 	img = Image(ones(Uint8, img_w, img_h).*255)
 	img.data[:, 2] = 0
@@ -430,11 +432,14 @@ function testBinaryStatic()
 	ImageView.display(img_decoded)
 
 	# DEBUG
-	lower_comp = lower_enc[1:end - (length(lower_enc) - 
-		length(lower_dec))] .- lower_dec
-	upper_comp = upper_enc[1:end - (length(upper_enc) - 
-		length(upper_dec))] .- upper_dec
-	assert(sum(lower_comp) + sum(upper_comp) == 0)
+	#info(reduce((x, y)->"$x $y", lower_enc))
+	#info(reduce((x, y)->"$x $y", lower_dec))
+	#info("\n" * reduce((x, y)->"$x\n$y", map(x->"$(x[1])\t$(x[3])\n$(x[2])\t$(x[4])\n\n", zip(lower_enc, lower_dec, upper_enc, upper_dec))))
+	#lower_comp = lower_enc[1:end - (length(lower_enc) - 
+	#	length(lower_dec))] .- lower_dec
+	#upper_comp = upper_enc[1:end - (length(upper_enc) - 
+	#	length(upper_dec))] .- upper_dec
+	#assert(sum(lower_comp) + sum(upper_comp) == 0)
 
 	assert(img.data == img_decoded.data)
 	info("Test done")
@@ -443,10 +448,10 @@ end
 function testBinaryLaplace()
 	info("Testing the Laplace model on a binary image.")
 	# DEBUG
-	global lower_enc = Array(Uint64, 0)
-	global upper_enc = Array(Uint64, 0)
-	global lower_dec = Array(Uint64, 0)
-	global upper_dec = Array(Uint64, 0)
+	global lower_enc = Array(Uint32, 0)
+	global upper_enc = Array(Uint32, 0)
+	global lower_dec = Array(Uint32, 0)
+	global upper_dec = Array(Uint32, 0)
 
 	img = Image(ones(Uint8, img_w, img_h).*0)
 	img.data[:, 2] = 255
