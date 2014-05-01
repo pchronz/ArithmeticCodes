@@ -368,8 +368,8 @@ function testGrayscaleStatic()
 	global lower_dec = Array(Uint32, 0)
 	global upper_dec = Array(Uint32, 0)
 
-	#img_64::Vector{Int} = rand(DiscreteUniform(0, 255), img_h*img_w)
-	img_64::Vector{Int} = rand(Binomial(256, 0.01), img_h*img_w) - 1
+	img_64::Vector{Int} = rand(DiscreteUniform(0, 255), img_h*img_w)
+	#img_64::Vector{Int} = rand(Binomial(255, 0.5), img_h*img_w)
 	img_8::Vector{Uint8} = map((x)->uint8(x), img_64)
 	img = Image(reshape(img_8, img_h, img_w))
 	ImageView.display(img)
@@ -453,8 +453,8 @@ function testBinaryLaplace()
 	global lower_dec = Array(Uint32, 0)
 	global upper_dec = Array(Uint32, 0)
 
-	img = Image(ones(Uint8, img_w, img_h).*0)
-	img.data[:, 2] = 255
+	img = Image(ones(Uint8, img_w, img_h).*255)
+	img.data[:, 2] = 0
 	ImageView.display(img)
 
 	tic()
