@@ -73,10 +73,12 @@ function encode(src::DataSource, src_it_state::SourceIterator, src_it::Function,
 	# This vector counts the occurences of symbols.
 	lower::Uint32 = uint32(0)
 	upper::Uint32 = uint32(0) - uint32(1)
+	lower_fl::Float64
+	upper_fl::Float64
 	while !src_it_state.done
 		src_it_state = src_it(src, src_it_state)
-		lower, upper = calculateboundaries(lower, upper, src, 
-			src_it_state)
+		lower_fl, upper_fl = calculateboundaries(src, src_it_state)
+		lower, upper = scaleboundaries(lower, upper, lower_fl, upper_fl)
 		assert(lower < upper)
 
 		overlaplength = calculateoverlap(lower, upper)
@@ -95,7 +97,8 @@ function encode(src::DataSource, src_it_state::SourceIterator, src_it::Function,
 	end
 	# Terminate the message
 	# Get the interval for the EOF symbol.
-	lower, upper = calculateboundaries(lower, upper, src)
+	lower_fl, upper_fl = calculateboundaries(src)
+	lower, upper = scaleboundaries(lower, upper, lower_fl, upper_fl)
 
 	# DEBUG
 	push!(lower_enc, lower)
@@ -176,6 +179,9 @@ function decodewindow!(lower::Uint32, upper::Uint32, window::Uint32, pos::Int,
 	# Since we cannot represent "1", we will compare as "<=" according to 
 		# our presicion instead of "<".
 	windowtop::Uint32 = window + (uint32(1) << (32 - pos)) - uint32(1)
+	# Floating point versions.
+	window_fl::Float64 = float64(window - lower + 1)/float64(upper - lower + 1)
+	wintop_fl::Float64 = float64(windowtop - lower + 1)/float64(upper - lower + 1)
 	# Indicator whether the window fit into one of the symbol intervals
 	# in a particular iterator over all symbols.
 	found::Bool = true
@@ -184,15 +190,16 @@ function decodewindow!(lower::Uint32, upper::Uint32, window::Uint32, pos::Int,
 		for sym in [collect(alphabet), EOF]
 			low::Uint32
 			up::Uint32
+			low_fl::Float64
+			up_fl::Float64
 			if sym == EOF
-				low, up = calculateboundaries(lower, upper, src)
+				low_fl, up_fl = calculateboundaries(src)
 			else
 				pushsymbol!(src, src_it_state, uint8(sym))
-				low, up = calculateboundaries(lower, upper, src,
-					src_it_state)
+				low_fl, up_fl = calculateboundaries(src, src_it_state)
 			end
 			# Check whether the symbol interval encloses the window.
-			if low <= window && up >= windowtop
+			if low_fl <= window_fl && up_fl >= wintop_fl
 				# If it is the EOF symbol, you're done.
 				if sym == EOF
 					info("Reached EOF symbol.")
@@ -205,6 +212,8 @@ function decodewindow!(lower::Uint32, upper::Uint32, window::Uint32, pos::Int,
 				# Increment the iterator.
 				src_it_state = src_it(src, src_it_state)
 
+				low, up = scaleboundaries(lower, upper, low_fl, up_fl)
+
 				# Shift the boundaries.
 				# Identify the identical bits and shift them out.
 				overlaplength = calculateoverlap(low, up)
@@ -214,6 +223,9 @@ function decodewindow!(lower::Uint32, upper::Uint32, window::Uint32, pos::Int,
 				window = window << overlaplength
 				pos -= overlaplength
 				windowtop = window + (uint32(1) << (32 - pos)) - uint32(1)
+
+				window_fl = float64(window - low + 1)/float64(up - low + 1)
+				wintop_fl = float64(windowtop - low + 1)/float64(up - low + 1)
 
 				# DEBUG
 				push!(lower_dec, low)
@@ -247,8 +259,7 @@ function scaleboundaries(lower::Uint32, upper::Uint32, low::Float64,
 end
 
 # Static probability model for grayscale images.
-function calculateboundariesgraystatic(lower::Uint32, upper::Uint32, 
-	src::DataSource, it_state::SourceIterator)
+function calculateboundariesgraystatic(src::DataSource, it_state::SourceIterator)
 	# Get the most recent symbol.
 	sym::Uint8 = src.data[it_state.h, it_state.w]
 	
@@ -260,21 +271,19 @@ function calculateboundariesgraystatic(lower::Uint32, upper::Uint32,
 	# Calculate the floating point boundaries.
 	low = sym*p_delta
 	up = (sym + 1)*p_delta
-	scaleboundaries(lower, upper, low, up)
+	low, up
 end
 # EOF version
-function calculateboundariesgraystatic(lower::Uint32, upper::Uint32, 
-	src::DataSource)
+function calculateboundariesgraystatic(src::DataSource)
 	num_pixels = prod(size(src.data))
 	p_EOF = 1.0/float64(num_pixels + 1)
 	low = 1.0 - p_EOF
 	up = 1.0
-	scaleboundaries(lower, upper, low, up)
+	low, up
 end
 
 # Static probability model.
-function calculateboundariesstatic(lower::Uint32, upper::Uint32, 
-	src::DataSource, it_state::SourceIterator)
+function calculateboundariesstatic(src::DataSource, it_state::SourceIterator)
 	# Get the most recent symbol.
 	sym::Uint8 = src.data[it_state.h, it_state.w]
 	
@@ -293,21 +302,19 @@ function calculateboundariesstatic(lower::Uint32, upper::Uint32,
 	else
 		error("The probablistic model cannot cope with symbol $sym.")
 	end
-	scaleboundaries(lower, upper, low, up)
+	low, up
 end
 # EOF version
-function calculateboundariesstatic(lower::Uint32, upper::Uint32, 
-	src::DataSource)
+function calculateboundariesstatic(src::DataSource)
 	num_pixels = prod(size(src.data))
 	p_EOF = 1.0/float64(num_pixels + 1)
 	low = 1.0 - p_EOF
 	up = 1.0
-	scaleboundaries(lower, upper, low, up)
+	low, up
 end
 
 # Laplace's rule of succession as adaptive probabilit model.
-function calculateboundarieslaplace(lower::Uint32, upper::Uint32, 
-	src::DataSource, it_state::SourceIterator)
+function calculateboundarieslaplace(src::DataSource, it_state::SourceIterator)
 	# Get the most recent symbol.
 	sym::Uint8
 	if !it_state.overflow
@@ -342,16 +349,15 @@ function calculateboundarieslaplace(lower::Uint32, upper::Uint32,
 	else
 		error("The probablistic model cannot cope with symbol $sym.")
 	end
-	scaleboundaries(lower, upper, low, up)
+	low, up
 end
 # EOF version
-function calculateboundarieslaplace(lower::Uint32, upper::Uint32, 
-	src::DataSource)
+function calculateboundarieslaplace(src::DataSource)
 	num_pixels = prod(size(src.data))
 	p_EOF = 1.0/float64(num_pixels + 1)
 	low = 1.0 - p_EOF
 	up = 1.0
-	scaleboundaries(lower, upper, low, up)
+	low, up
 end
 
 # Test it.
