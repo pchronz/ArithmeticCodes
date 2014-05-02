@@ -1,13 +1,15 @@
-# XXX Reimplement scaleboundaries, avoiding rounding, conversion and BigFloat.
-# XXX Implement decodewindow without recursion.
+# TODO Use binary search on intervals.
+# TODO Only compute the necessary values in the interval. When going linearly,
+	# compute one by one. When using binary search, compute half by half.
+# TODO Make encoding and decoding independent of the type of symbol again.
+# TODO Sub-sample recomputation of intervals.
+# TODO There are errors on some images. Randomize the sources, save them, and 
+	# identify and solve the problem.
 # TODO Use generic functions to be flexible with the source alphabet.
-# TODO Single Gaussian probabilistic model.
-# TODO tests?
+# TODO Tests
 # TODO Decode based on Vector{Uint8, 1} instead of Chars with binary symbols.
-# TODO Avod copying where it is not necessary and use subarrays instead.
+# TODO Avoid copying where it is not necessary and use subarrays instead.
 # TODO Extend function names that manipulate parameters with an exclamation mark
-# TODO Re-use calculations. For example in the probabilistc model don't 
-#	recompute the whole model if not necessary, instead update it. Use as co-routine?!
 
 module arithmo4astro
 using Images
@@ -75,9 +77,14 @@ function encode(src::DataSource, src_it_state::SourceIterator, src_it::Function,
 	upper::Uint32 = uint32(0) - uint32(1)
 	lower_fl::Float64
 	upper_fl::Float64
+	# XXX Make it generic again.
+	intervals::Vector{Float64} = zeros(Float64, 258)
 	while !src_it_state.done
 		src_it_state = src_it(src, src_it_state)
-		lower_fl, upper_fl = calculateboundaries(src, src_it_state)
+		# XXX Make it generic again.
+		calculateboundaries(intervals, 0, src, src_it_state)
+		lower_fl = intervals[src.data[src_it_state.h, src_it_state.w] + 1]
+		upper_fl = intervals[src.data[src_it_state.h, src_it_state.w] + 2]
 		lower, upper = scaleboundaries(lower, upper, lower_fl, upper_fl)
 		assert(lower < upper)
 
@@ -97,7 +104,10 @@ function encode(src::DataSource, src_it_state::SourceIterator, src_it::Function,
 	end
 	# Terminate the message
 	# Get the interval for the EOF symbol.
-	lower_fl, upper_fl = calculateboundaries(src)
+	# XXX Make it generic again.
+	calculateboundaries(intervals, 0, src, src_it_state)
+	lower_fl = intervals[end - 1]
+	upper_fl = intervals[end]
 	lower, upper = scaleboundaries(lower, upper, lower_fl, upper_fl)
 
 	# DEBUG
@@ -187,27 +197,55 @@ function decodewindow!(lower::Uint32, upper::Uint32, window::Uint32, pos::Int,
 	found::Bool = true
 	while found
 		found = false
-		for sym in [collect(alphabet), EOF]
+		# The symbols we operate on; the alphabet and the EOF symbol.
+		symbols::Vector = [collect(alphabet), EOF]
+		# Management for binary search.
+		binsearch_done::Bool = false
+		lower_idx::Int = 1
+		upper_idx::Int = length(symbols)
+		# Compute all intervals, to allow for binary search.
+		intervals::Vector{Float64} = zeros(Float64, length(symbols) + 1)
+		symbol_progress::Int = 0
+		while !binsearch_done
+			# Get the next symbol
+			idx::Int = int(floor((upper_idx - lower_idx + 1)/2)) + lower_idx
+			calculateboundaries(intervals, symbol_progress, src, src_it_state, idx)
+			symbol_progress = idx
+			sym = symbols[idx]
+
 			low::Uint32
 			up::Uint32
 			low_fl::Float64
 			up_fl::Float64
 			if sym == EOF
-				low_fl, up_fl = calculateboundaries(src)
+				low_fl = intervals[end - 1]
+				up_fl = 1.0
 			else
-				pushsymbol!(src, src_it_state, uint8(sym))
-				low_fl, up_fl = calculateboundaries(src, src_it_state)
+				# XXX Make it work with generic alphabets.
+				low_fl = intervals[sym + 1]
+				up_fl = intervals[sym + 2]
 			end
-			# Check whether the symbol interval encloses the window.
+			assert(low_fl < up_fl)
+			assert(window_fl < wintop_fl)
+			# There are five cases to test for binary search:
+			# 1 The symbol interval matches the window. --> we're done here.
+			# 3 The symbol interval crosses the upper boundary. --> fail.
+			# 4 The symbol interval is below the lower boundary. --> Go below.
+			# 5 The symbol interval is above the upper boundary. --> Go above.
+			# 6 The window encloses the symbol interval. --> fail.
+			# Check case 1:
+			# Does the interval match the window?
 			if low_fl <= window_fl && up_fl >= wintop_fl
 				# If it is the EOF symbol, you're done.
 				if sym == EOF
 					info("Reached EOF symbol.")
 					return lower, upper, window, pos
 				end
-				# Otherwise the symbol is already in the target,
+				# Otherwise push the symbol into the target,
 				# and you need to increment the iterator, update
 				# the boundaries, and shift both.
+
+				pushsymbol!(src, src_it_state, sym)
 
 				# Increment the iterator.
 				src_it_state = src_it(src, src_it_state)
@@ -242,7 +280,33 @@ function decodewindow!(lower::Uint32, upper::Uint32, window::Uint32, pos::Int,
 
 				# Signal that we need to go even deeper.
 				found = true
-				break
+				binsearch_done = true
+				# Check case 2:
+				# Does the interval cross the lower boundary?
+			elseif low_fl < window_fl && up_fl >= window_fl
+				binsearch_done = true
+				# Check case 3:
+				# Does the interval cross the upper boundary?
+			elseif up_fl > wintop_fl && low_fl <= wintop_fl
+				binsearch_done = true
+				# Check case 4:
+				# Is the interval below the window?
+			elseif low_fl < window_fl && up_fl < window_fl
+				lower_idx = idx + 1
+				# Check case 5:
+				# Is the interval above the window?
+			elseif low_fl > wintop_fl && up_fl > wintop_fl
+				upper_idx = idx - 1
+				# Check case 6:
+				# Does window enclose the symbol interval?
+			elseif low_fl >= window_fl && up_fl <= wintop_fl
+				binsearch_done = true
+			else
+				info("window_fl -> $(window_fl)")
+				info("wintop_fl -> $(wintop_fl)")
+				info("low_fl -> $(low_fl)")
+				info("up_fl -> $(up_fl)")
+				error("Reached an impossible state during binary search.")
 			end
 		end
 	end
@@ -253,33 +317,34 @@ function scaleboundaries(lower::Uint32, upper::Uint32, low::Float64,
 	up::Float64)
 	# scale the boundaries
 	p::Uint32 = upper - lower
-	upper::Uint32 = uint32(lower) + uint32(round(float64(p)*float64(up))) - uint32(1)
-	lower::Uint32 = uint32(lower) + uint32(round(float64(p)*float64(low)))
+	upper::Uint32 = uint32(lower) + uint32(round((float64(p) + 1.0)*float64(up))) - uint32(1)
+	lower::Uint32 = uint32(lower) + uint32(round((float64(p) + 1.0)*float64(low)))
 	lower, upper
 end
 
 # Static probability model for grayscale images.
-function calculateboundariesgraystatic(src::DataSource, it_state::SourceIterator)
+# Given the observed values in src up to the iterator compute the probabilites on the alphabet up to the upper idx symbol.
+function calculateboundariesgraystatic(intervals::Vector{Float64}, progress::Int, src::DataSource, it_state::SourceIterator, upper_idx::Int=0)
+	if upper_idx == 0
+		upper_idx = 257
+	end
+	if progress == upper_idx
+		return 
+	end
+
 	# Get the most recent symbol.
 	sym::Uint8 = src.data[it_state.h, it_state.w]
-	
+
 	num_pixels = prod(size(src.data))
-	p_EOF = 1.0/float64(num_pixels + 1)
+	p_EOF = 1.0/(num_pixels + 1)
 	p_delta = 1.0/256.0 * (1.0 - p_EOF)
 	assert(p_delta*256 == 1.0 - p_EOF)
 
-	# Calculate the floating point boundaries.
-	low = sym*p_delta
-	up = (sym + 1)*p_delta
-	low, up
-end
-# EOF version
-function calculateboundariesgraystatic(src::DataSource)
-	num_pixels = prod(size(src.data))
-	p_EOF = 1.0/float64(num_pixels + 1)
-	low = 1.0 - p_EOF
-	up = 1.0
-	low, up
+	intervals[1] = 0.0
+	for i = (progress + 1):upper_idx
+		intervals[i + 1] = intervals[i] + p_delta
+	end
+	intervals[end] = 1.0
 end
 
 # Static probability model.
@@ -313,7 +378,7 @@ function calculateboundariesstatic(src::DataSource)
 	low, up
 end
 
-# Laplace's rule of succession as adaptive probabilit model.
+# Laplace's rule of succession as adaptive probability model.
 function calculateboundarieslaplace(src::DataSource, it_state::SourceIterator)
 	# Get the most recent symbol.
 	sym::Uint8
@@ -361,8 +426,8 @@ function calculateboundarieslaplace(src::DataSource)
 end
 
 # Test it.
-img_w = 50
-img_h = 50
+img_w = 100
+img_h = 100
 
 EOF = "EOF"
 
@@ -491,8 +556,8 @@ function testBinaryLaplace()
 	info("Test done")
 end
 
-testBinaryStatic()
-testBinaryLaplace()
+#testBinaryStatic()
+#testBinaryLaplace()
 testGrayscaleStatic()
 
 end
