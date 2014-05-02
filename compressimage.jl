@@ -22,6 +22,9 @@ type TwoDIterator <: SourceIterator
 	h::Uint
 	done::Bool
 	overflow::Bool
+	copy::TwoDIterator
+	TwoDIterator(w::Uint, h::Uint, done::Bool, overflow::Bool) = new(w, h, done, overflow)
+	TwoDIterator(w::Uint, h::Uint, done::Bool, overflow::Bool, copy::TwoDIterator) = new(w, h, done, overflow, copy)
 end
 function TwoDIterator(first=false)
 	if first
@@ -38,14 +41,20 @@ end
 function TwoDGreyImage(data::Array{Uint8, 2})
 	TwoDGreyImage(data, Array(Uint8, 0))
 end
-function hor2diterator(src::TwoDGreyImage, iterator::TwoDIterator)
+function hor2diterator(src::TwoDGreyImage, iterator::TwoDIterator, holdcopy::Bool = false)
 	if iterator.done
 		iterator.overflow = true
+		if holdcopy
+			iterator.copy = TwoDIterator(iterator.w, iterator.h, iterator.done, iterator.overflow)
+		end
 		return iterator
 	else
 		if iterator.w == 0 && iterator.h == 0
 			iterator.w = 1
 			iterator.h = 1
+			if holdcopy
+				iterator.copy = TwoDIterator(iterator.w, iterator.h, iterator.done, iterator.overflow)
+			end
 			return iterator
 		end
 		height, width = size(src.data)
@@ -55,6 +64,9 @@ function hor2diterator(src::TwoDGreyImage, iterator::TwoDIterator)
 			iterator.w = 1
 		elseif iterator.w == width && iterator.h == height
 			iterator.done = true
+		end
+		if holdcopy
+			iterator.copy = TwoDIterator(iterator.w, iterator.h, iterator.done, iterator.overflow)
 		end
 		return iterator
 	end
@@ -69,7 +81,7 @@ end
 
 # encode the image pixel by pixel
 function encode(src::DataSource, src_it_state::SourceIterator, src_it::Function,
-	 calculateboundaries::Function)
+	 calculateboundaries::Function, refresh_rate::Int)
 	# Encoded vector
 	encoded::Vector{Char} = Array(Char, 0)
 	# This vector counts the occurences of symbols.
@@ -79,10 +91,15 @@ function encode(src::DataSource, src_it_state::SourceIterator, src_it::Function,
 	upper_fl::Float64
 	# XXX Make it generic again.
 	intervals::Vector{Float64} = zeros(Float64, 258)
+	# A counter for the refresh rate of the probability model.
+	refresh_ctr::Int = 0
 	while !src_it_state.done
 		src_it_state = src_it(src, src_it_state)
-		# XXX Make it generic again.
-		calculateboundaries(intervals, 0, src, src_it_state)
+		if refresh_ctr % refresh_rate == 0
+			# XXX Make it generic again.
+			calculateboundaries(intervals, 0, src, src_it_state)
+		end
+		refresh_ctr += 1
 		lower_fl = intervals[src.data[src_it_state.h, src_it_state.w] + 1]
 		upper_fl = intervals[src.data[src_it_state.h, src_it_state.w] + 2]
 		lower, upper = scaleboundaries(lower, upper, lower_fl, upper_fl)
@@ -105,7 +122,9 @@ function encode(src::DataSource, src_it_state::SourceIterator, src_it::Function,
 	# Terminate the message
 	# Get the interval for the EOF symbol.
 	# XXX Make it generic again.
-	calculateboundaries(intervals, 0, src, src_it_state)
+	if refresh_ctr % refresh_rate == 0
+		calculateboundaries(intervals, 0, src, src_it_state)
+	end
 	lower_fl = intervals[end - 1]
 	upper_fl = intervals[end]
 	lower, upper = scaleboundaries(lower, upper, lower_fl, upper_fl)
@@ -144,6 +163,7 @@ end
 function calculateoverlap(lower::Uint32, upper::Uint32)
 	# find out which bits are the same
 	samebits = ~(lower $ upper)
+	# XXX Performance!
 	regmatch = match(r"(1*)(.*)$", bits(samebits))
 	overlaplength = length(regmatch.captures[1])
 	overlaplength
@@ -151,7 +171,7 @@ end
 
 function decode!(encoded::Vector{Char}, alphabet::Vector{Uint8}, src::DataSource, 
 	src_it_state::SourceIterator, src_it::Function, 
-	calculateboundaries::Function)
+	calculateboundaries::Function, refresh_rate::Int)
 	# Window that holds the open code symbols, until a new source symbol 
 		#is identified.
 	window::Uint32 = 0
@@ -160,6 +180,8 @@ function decode!(encoded::Vector{Char}, alphabet::Vector{Uint8}, src::DataSource
 	# Lower and upper boundaries for the symbols.
 	lower::Uint32 = 0
 	upper::Uint32 = 0 - 1
+	# The counter for the refresh rate for the probability model.
+	refresh_ctr::Int = 0
 	# Go through the target symbols
 	for tc in encoded
 		pos += 1
@@ -175,16 +197,15 @@ function decode!(encoded::Vector{Char}, alphabet::Vector{Uint8}, src::DataSource
 		# Push the codeword symbol into the window
 		window = window | (t << (32 - pos))
 		# Decode all source symbols using the codeword interval.
-		lower, upper, window, pos = decodewindow!(lower, upper, window, 
+		lower, upper, window, pos, refresh_ctr = decodewindow!(alphabet, lower, upper, window, 
 			pos, alphabet, src, src_it_state, src_it, 
-			calculateboundaries)
+			calculateboundaries, refresh_ctr, refresh_rate)
 	end
 	src
 end
-
-function decodewindow!(lower::Uint32, upper::Uint32, window::Uint32, pos::Int,
+function decodewindow!(symbols::Vector{Uint8}, lower::Uint32, upper::Uint32, window::Uint32, pos::Int,
 	alphabet::Vector{Uint8}, src::DataSource, src_it_state::SourceIterator, 
-	src_it::Function, calculateboundaries::Function)
+	src_it::Function, calculateboundaries::Function, refresh_ctr::Int, refresh_rate::Int)
 	# The upper boundary of the window interval.
 	# Since we cannot represent "1", we will compare as "<=" according to 
 		# our presicion instead of "<".
@@ -192,39 +213,34 @@ function decodewindow!(lower::Uint32, upper::Uint32, window::Uint32, pos::Int,
 	# Floating point versions.
 	window_fl::Float64 = float64(window - lower + 1)/float64(upper - lower + 1)
 	wintop_fl::Float64 = float64(windowtop - lower + 1)/float64(upper - lower + 1)
+	# Allocate the intervals vector, to allow for binary search.
+	intervals::Vector{Float64} = Array(Float64, length(symbols) + 2)
 	# Indicator whether the window fit into one of the symbol intervals
 	# in a particular iterator over all symbols.
 	found::Bool = true
 	while found
 		found = false
-		# The symbols we operate on; the alphabet and the EOF symbol.
-		symbols::Vector = [collect(alphabet), EOF]
 		# Management for binary search.
 		binsearch_done::Bool = false
 		lower_idx::Int = 1
-		upper_idx::Int = length(symbols)
-		# Compute all intervals, to allow for binary search.
-		intervals::Vector{Float64} = zeros(Float64, length(symbols) + 1)
+		upper_idx::Int = length(symbols) + 1
+		# Reset the progress indicator
 		symbol_progress::Int = 0
 		while !binsearch_done
 			# Get the next symbol
 			idx::Int = int(floor((upper_idx - lower_idx + 1)/2)) + lower_idx
-			calculateboundaries(intervals, symbol_progress, src, src_it_state, idx)
-			symbol_progress = idx
-			sym = symbols[idx]
+			if refresh_ctr % refresh_rate == 0
+				calculateboundaries(intervals, symbol_progress, src, src_it_state, idx)
+				symbol_progress = idx
+			else
+				calculateboundaries(intervals, symbol_progress, src, src_it_state.copy, idx)
+				symbol_progress = max(idx, symbol_progress)
+			end
 
 			low::Uint32
 			up::Uint32
-			low_fl::Float64
-			up_fl::Float64
-			if sym == EOF
-				low_fl = intervals[end - 1]
-				up_fl = 1.0
-			else
-				# XXX Make it work with generic alphabets.
-				low_fl = intervals[sym + 1]
-				up_fl = intervals[sym + 2]
-			end
+			low_fl::Float64 = intervals[idx]
+			up_fl::Float64 = intervals[idx + 1]
 			assert(low_fl < up_fl)
 			assert(window_fl < wintop_fl)
 			# There are five cases to test for binary search:
@@ -237,18 +253,23 @@ function decodewindow!(lower::Uint32, upper::Uint32, window::Uint32, pos::Int,
 			# Does the interval match the window?
 			if low_fl <= window_fl && up_fl >= wintop_fl
 				# If it is the EOF symbol, you're done.
-				if sym == EOF
+				if idx == length(alphabet) + 1
 					info("Reached EOF symbol.")
-					return lower, upper, window, pos
+					return lower, upper, window, pos, refresh_ctr
 				end
 				# Otherwise push the symbol into the target,
 				# and you need to increment the iterator, update
 				# the boundaries, and shift both.
 
-				pushsymbol!(src, src_it_state, sym)
+				pushsymbol!(src, src_it_state, symbols[idx])
 
 				# Increment the iterator.
-				src_it_state = src_it(src, src_it_state)
+				if refresh_ctr % refresh_rate == 0
+					src_it_state = src_it(src, src_it_state, true)
+				else
+					src_it_state = src_it(src, src_it_state)
+				end
+				refresh_ctr += 1
 
 				low, up = scaleboundaries(lower, upper, low_fl, up_fl)
 
@@ -310,7 +331,7 @@ function decodewindow!(lower::Uint32, upper::Uint32, window::Uint32, pos::Int,
 			end
 		end
 	end
-	lower, upper, window, pos
+	lower, upper, window, pos, refresh_ctr
 end
 
 function scaleboundaries(lower::Uint32, upper::Uint32, low::Float64, 
@@ -426,7 +447,7 @@ function calculateboundarieslaplace(src::DataSource)
 end
 
 # Test it.
-img_w = 100
+img_w = 1000
 img_h = 100
 
 EOF = "EOF"
@@ -445,18 +466,22 @@ function testGrayscaleStatic()
 	img = Image(reshape(img_8, img_h, img_w))
 	ImageView.display(img)
 
+	refresh_rate::Int = 10
+
 	tic()
 	# Static probabilistic model.
 	encoded = encode(TwoDGreyImage(img.data), TwoDIterator(), hor2diterator,
-		calculateboundariesgraystatic)
+		calculateboundariesgraystatic, refresh_rate)
 	toc()
 	info("Encoded length: $(length(encoded))")
 
 	tic()
 	# Static probabilistic model.
-	decoded = decode!(encoded, Uint8[0:255], 
+	Profile.clear()
+	@profile decoded = decode!(encoded, Uint8[0:255], 
 		TwoDGreyImage(zeros(Uint8, size(img.data))), TwoDIterator(true),
-		hor2diterator, calculateboundariesgraystatic)
+		hor2diterator, calculateboundariesgraystatic, refresh_rate)
+	Profile.print()
 	toc()
 	info("$(img_w*img_h - length(decoded.data)) pixels were missing")
 	img_decoded = Image(decoded.data)
