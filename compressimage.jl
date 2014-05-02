@@ -162,11 +162,19 @@ end
 
 function calculateoverlap(lower::Uint32, upper::Uint32)
 	# find out which bits are the same
-	samebits = ~(lower $ upper)
-	# XXX Performance!
-	regmatch = match(r"(1*)(.*)$", bits(samebits))
-	overlaplength = length(regmatch.captures[1])
-	overlaplength
+	samebits::Uint32 = ~(lower $ upper)
+	# TODO Implement binary search
+	done::Bool = false
+	pos::Int = 1
+	while !done && pos <= 32
+		res::Uint32 = samebits | (uint32(1) << (32 - pos))
+		if res != samebits
+			done = true
+		else
+			pos += 1
+		end
+	end
+	pos - 1
 end
 
 function decode!(encoded::Vector{Char}, alphabet::Vector{Uint8}, src::DataSource, 
@@ -176,12 +184,14 @@ function decode!(encoded::Vector{Char}, alphabet::Vector{Uint8}, src::DataSource
 		#is identified.
 	window::Uint32 = 0
 	# Pointer to the current position in the interval window string
-	pos = 0
+	pos::Int = 0
 	# Lower and upper boundaries for the symbols.
 	lower::Uint32 = 0
 	upper::Uint32 = 0 - 1
 	# The counter for the refresh rate for the probability model.
 	refresh_ctr::Int = 0
+	# Allocate the intervals vector, to allow for binary search.
+	intervals::Vector{Float64} = Array(Float64, length(alphabet) + 2)
 	# Go through the target symbols
 	for tc in encoded
 		pos += 1
@@ -196,25 +206,24 @@ function decode!(encoded::Vector{Char}, alphabet::Vector{Uint8}, src::DataSource
 		t = uint32(tc) - 48
 		# Push the codeword symbol into the window
 		window = window | (t << (32 - pos))
+
 		# Decode all source symbols using the codeword interval.
-		lower, upper, window, pos, refresh_ctr = decodewindow!(alphabet, lower, upper, window, 
-			pos, alphabet, src, src_it_state, src_it, 
-			calculateboundaries, refresh_ctr, refresh_rate)
+		lower, upper, window, pos, refresh_ctr = decodewindow!(intervals, alphabet, lower, upper, window, 
+			pos, src, src_it_state, src_it, calculateboundaries, refresh_ctr, refresh_rate)
 	end
 	src
 end
-function decodewindow!(symbols::Vector{Uint8}, lower::Uint32, upper::Uint32, window::Uint32, pos::Int,
-	alphabet::Vector{Uint8}, src::DataSource, src_it_state::SourceIterator, 
+
+function decodewindow!(intervals::Vector{Float64}, alphabet::Vector{Uint8}, lower::Uint32, upper::Uint32, window::Uint32, pos::Int,
+	src::DataSource, src_it_state::SourceIterator, 
 	src_it::Function, calculateboundaries::Function, refresh_ctr::Int, refresh_rate::Int)
 	# The upper boundary of the window interval.
 	# Since we cannot represent "1", we will compare as "<=" according to 
 		# our presicion instead of "<".
-	windowtop::Uint32 = window + (uint32(1) << (32 - pos)) - uint32(1)
+	windowtop::Uint32 = window + uint32(1 << (32 - pos)) - 1
 	# Floating point versions.
 	window_fl::Float64 = float64(window - lower + 1)/float64(upper - lower + 1)
 	wintop_fl::Float64 = float64(windowtop - lower + 1)/float64(upper - lower + 1)
-	# Allocate the intervals vector, to allow for binary search.
-	intervals::Vector{Float64} = Array(Float64, length(symbols) + 2)
 	# Indicator whether the window fit into one of the symbol intervals
 	# in a particular iterator over all symbols.
 	found::Bool = true
@@ -223,7 +232,7 @@ function decodewindow!(symbols::Vector{Uint8}, lower::Uint32, upper::Uint32, win
 		# Management for binary search.
 		binsearch_done::Bool = false
 		lower_idx::Int = 1
-		upper_idx::Int = length(symbols) + 1
+		upper_idx::Int = length(alphabet) + 1
 		# Reset the progress indicator
 		symbol_progress::Int = 0
 		while !binsearch_done
@@ -261,7 +270,7 @@ function decodewindow!(symbols::Vector{Uint8}, lower::Uint32, upper::Uint32, win
 				# and you need to increment the iterator, update
 				# the boundaries, and shift both.
 
-				pushsymbol!(src, src_it_state, symbols[idx])
+				pushsymbol!(src, src_it_state, alphabet[idx])
 
 				# Increment the iterator.
 				if refresh_ctr % refresh_rate == 0
@@ -448,7 +457,7 @@ end
 
 # Test it.
 img_w = 1000
-img_h = 100
+img_h = 1000
 
 EOF = "EOF"
 
@@ -466,7 +475,7 @@ function testGrayscaleStatic()
 	img = Image(reshape(img_8, img_h, img_w))
 	ImageView.display(img)
 
-	refresh_rate::Int = 10
+	refresh_rate::Int = 1
 
 	tic()
 	# Static probabilistic model.
@@ -477,11 +486,11 @@ function testGrayscaleStatic()
 
 	tic()
 	# Static probabilistic model.
-	Profile.clear()
-	@profile decoded = decode!(encoded, Uint8[0:255], 
-		TwoDGreyImage(zeros(Uint8, size(img.data))), TwoDIterator(true),
+	#Profile.clear()
+	decoded = TwoDGreyImage(zeros(Uint8, size(img.data)))
+	decode!(encoded, Uint8[0:255], decoded, TwoDIterator(true),
 		hor2diterator, calculateboundariesgraystatic, refresh_rate)
-	Profile.print()
+	#Profile.print()
 	toc()
 	info("$(img_w*img_h - length(decoded.data)) pixels were missing")
 	img_decoded = Image(decoded.data)
