@@ -80,7 +80,7 @@ function pushsymbol!(src::TwoDGreyImage, src_it::TwoDIterator, sym::Uint8)
 end
 
 # encode the image pixel by pixel
-function encode(src::DataSource, src_it_state::SourceIterator, src_it::Function,
+function encode(alphabet::Vector{Uint8}, src::DataSource, src_it_state::SourceIterator, src_it::Function,
 	 calculateboundaries::Function, refresh_rate::Int)
 	# Encoded vector
 	encoded::Vector{Char} = Array(Char, 0)
@@ -90,18 +90,26 @@ function encode(src::DataSource, src_it_state::SourceIterator, src_it::Function,
 	lower_fl::Float64
 	upper_fl::Float64
 	# XXX Make it generic again.
-	intervals::Vector{Float64} = zeros(Float64, 258)
+	intervals::Vector{Float64} = Array(Float64, length(alphabet) + 2)
+	# Compute the indices for the symbols.
+	# XXX Will only work numberic alphabets, unless we first transform the alphabet to a numeric alphabet.
+	# XXX What a waste of memory! Consider using a dictionary.
+	symbol_idxs::Dict{Uint8, Int} = Dict{Uint8, Int}()
+	for (i,s) in enumerate(alphabet)
+		symbol_idxs[s] = i
+	end
 	# A counter for the refresh rate of the probability model.
 	refresh_ctr::Int = 0
 	while !src_it_state.done
 		src_it_state = src_it(src, src_it_state)
 		if refresh_ctr % refresh_rate == 0
-			# XXX Make it generic again.
 			calculateboundaries(intervals, 0, src, src_it_state)
 		end
 		refresh_ctr += 1
-		lower_fl = intervals[src.data[src_it_state.h, src_it_state.w] + 1]
-		upper_fl = intervals[src.data[src_it_state.h, src_it_state.w] + 2]
+		# XXX Make it generic again.
+		symbol_idx::Int = symbol_idxs[src.data[src_it_state.h, src_it_state.w]]
+		lower_fl = intervals[symbol_idx]
+		upper_fl = intervals[symbol_idx + 1]
 		lower, upper = scaleboundaries(lower, upper, lower_fl, upper_fl)
 		assert(lower < upper)
 
@@ -220,12 +228,12 @@ function decodewindow!(intervals::Vector{Float64}, alphabet::Vector{Uint8}, lowe
 	# The upper boundary of the window interval.
 	# Since we cannot represent "1", we will compare as "<=" according to 
 		# our presicion instead of "<".
-	windowtop::Uint32 = window + uint32(1 << (32 - pos)) - 1
+	windowtop::Uint32 = window + uint32(1 << (32 - pos)) - uint32(1)
 	# Floating point versions.
 	window_fl::Float64 = float64(window - lower + 1)/float64(upper - lower + 1)
 	wintop_fl::Float64 = float64(windowtop - lower + 1)/float64(upper - lower + 1)
 	# Indicator whether the window fit into one of the symbol intervals
-	# in a particular iterator over all symbols.
+		# in a particular iterator over all symbols.
 	found::Bool = true
 	while found
 		found = false
@@ -362,9 +370,6 @@ function calculateboundariesgraystatic(intervals::Vector{Float64}, progress::Int
 		return 
 	end
 
-	# Get the most recent symbol.
-	sym::Uint8 = src.data[it_state.h, it_state.w]
-
 	num_pixels = prod(size(src.data))
 	p_EOF = 1.0/(num_pixels + 1)
 	p_delta = 1.0/256.0 * (1.0 - p_EOF)
@@ -378,45 +383,22 @@ function calculateboundariesgraystatic(intervals::Vector{Float64}, progress::Int
 end
 
 # Static probability model.
-function calculateboundariesstatic(src::DataSource, it_state::SourceIterator)
-	# Get the most recent symbol.
-	sym::Uint8 = src.data[it_state.h, it_state.w]
-	
+function calculateboundariesstatic(intervals::Vector{Float64}, progress::Int, src::DataSource, it_state::SourceIterator, upper_idx::Int=0)
 	num_pixels = prod(size(src.data))
 	p_EOF = 1.0/float64(num_pixels + 1)
-	p_lo = float64(size(src.data)[1])/float64(num_pixels + 1)
-	p_hi = 1 - p_EOF - p_lo
+	p_lo = float64(size(src.data, 1))/float64(num_pixels + 1)
+	p_hi = 1 - p_EOF
 
-	# Calculate the floating point boundaries.
-	if sym == 0
-		low = 0.0
-		up = p_lo
-	elseif sym == 255
-		low = p_lo
-		up = p_lo + p_hi
-	else
-		error("The probablistic model cannot cope with symbol $sym.")
-	end
-	low, up
-end
-# EOF version
-function calculateboundariesstatic(src::DataSource)
-	num_pixels = prod(size(src.data))
-	p_EOF = 1.0/float64(num_pixels + 1)
-	low = 1.0 - p_EOF
-	up = 1.0
-	low, up
+	intervals[1] = 0.0
+	intervals[2] = p_lo
+	intervals[3] = p_hi
+	intervals[4] = 1.0
+
+	intervals
 end
 
 # Laplace's rule of succession as adaptive probability model.
-function calculateboundarieslaplace(src::DataSource, it_state::SourceIterator)
-	# Get the most recent symbol.
-	sym::Uint8
-	if !it_state.overflow
-		sym = src.data[it_state.h, it_state.w]
-	else
-		sym = src.overflow[end]
-	end
+function calculateboundarieslaplace(intervals::Vector{Float64}, progress::Int, src::DataSource, it_state::SourceIterator, upper_idx::Int=0)
 	img_w = size(src.data)[2]
 
 	num_pixels = prod(size(src.data))
@@ -434,30 +416,15 @@ function calculateboundarieslaplace(src::DataSource, it_state::SourceIterator)
 	p_hi = (p_hi + 1)/(num_covered + 2)*(1.0 - p_EOF)
 	p_lo = (1.0 - p_EOF) - p_hi
 
-	# Calculate the floating point boundaries.
-	if sym == 0
-		low = 0.0
-		up = p_lo
-	elseif sym == 255
-		low = p_lo
-		up = 1.0 - p_EOF
-	else
-		error("The probablistic model cannot cope with symbol $sym.")
-	end
-	low, up
-end
-# EOF version
-function calculateboundarieslaplace(src::DataSource)
-	num_pixels = prod(size(src.data))
-	p_EOF = 1.0/float64(num_pixels + 1)
-	low = 1.0 - p_EOF
-	up = 1.0
-	low, up
+	intervals[1] = 0.0
+	intervals[2] = p_lo
+	intervals[3] = 1.0 - p_EOF
+	intervals[4] = 1.0
 end
 
 # Test it.
 img_w = 1000
-img_h = 1000
+img_h = 100
 
 EOF = "EOF"
 
@@ -479,7 +446,7 @@ function testGrayscaleStatic()
 
 	tic()
 	# Static probabilistic model.
-	encoded = encode(TwoDGreyImage(img.data), TwoDIterator(), hor2diterator,
+	encoded = encode(Uint8[0:255], TwoDGreyImage(img.data), TwoDIterator(), hor2diterator,
 		calculateboundariesgraystatic, refresh_rate)
 	toc()
 	info("Encoded length: $(length(encoded))")
@@ -519,18 +486,20 @@ function testBinaryStatic()
 	img.data[:, 2] = 0
 	ImageView.display(img)
 
+	refresh_rate::Int = 1
+
 	tic()
 	# Static probabilistic model.
-	encoded = encode(TwoDGreyImage(img.data), TwoDIterator(), hor2diterator,
-		calculateboundariesstatic)
+	encoded = encode(Uint8[0, 255], TwoDGreyImage(img.data), TwoDIterator(), hor2diterator,
+		calculateboundariesstatic, refresh_rate)
 	toc()
 	info("Encoded length: $(length(encoded))")
 
 	tic()
 	# Static probabilistic model.
-	decoded = decode!(encoded, Uint8[0, 255], 
-		   TwoDGreyImage(zeros(Uint8, size(img.data))), 
-		   TwoDIterator(true), hor2diterator, calculateboundariesstatic)
+	decoded = TwoDGreyImage(zeros(Uint8, size(img.data)))
+	decode!(encoded, Uint8[0, 255], decoded, TwoDIterator(true),
+		hor2diterator, calculateboundariesstatic, refresh_rate)
 	toc()
 	info("$(img_w*img_h - length(decoded.data)) pixels were missing")
 	img_decoded = Image(decoded.data)
@@ -540,11 +509,11 @@ function testBinaryStatic()
 	#info(reduce((x, y)->"$x $y", lower_enc))
 	#info(reduce((x, y)->"$x $y", lower_dec))
 	#info("\n" * reduce((x, y)->"$x\n$y", map(x->"$(x[1])\t$(x[3])\n$(x[2])\t$(x[4])\n\n", zip(lower_enc, lower_dec, upper_enc, upper_dec))))
-	#lower_comp = lower_enc[1:end - (length(lower_enc) - 
-	#	length(lower_dec))] .- lower_dec
-	#upper_comp = upper_enc[1:end - (length(upper_enc) - 
-	#	length(upper_dec))] .- upper_dec
-	#assert(sum(lower_comp) + sum(upper_comp) == 0)
+	lower_comp = lower_enc[1:end - (length(lower_enc) - 
+		length(lower_dec))] .- lower_dec
+	upper_comp = upper_enc[1:end - (length(upper_enc) - 
+		length(upper_dec))] .- upper_dec
+	assert(sum(lower_comp) + sum(upper_comp) == 0)
 
 	assert(img.data == img_decoded.data)
 	info("Test done")
@@ -562,18 +531,20 @@ function testBinaryLaplace()
 	img.data[:, 2] = 0
 	ImageView.display(img)
 
+	refresh_rate::Int = 1
+
 	tic()
 	# Laplace's rule of succession as adaptive model.
-	encoded = encode(TwoDGreyImage(img.data), TwoDIterator(), hor2diterator,
-		calculateboundarieslaplace)
+	encoded = encode(Uint8[0, 255], TwoDGreyImage(img.data), TwoDIterator(), hor2diterator,
+		calculateboundarieslaplace, refresh_rate)
 	toc()
 	info("Encoded length: $(length(encoded))")
 
 	tic()
 	# Laplace's rule of succession as adaptive model.
-	decoded = decode!(encoded, Uint8[0, 255], 
-		TwoDGreyImage(zeros(Uint8, size(img.data))), TwoDIterator(true), 
-		hor2diterator, calculateboundarieslaplace)
+	decoded = TwoDGreyImage(zeros(Uint8, size(img.data)))
+	decode!(encoded, Uint8[0, 255], decoded, TwoDIterator(true),
+		hor2diterator, calculateboundarieslaplace, refresh_rate)
 	toc()
 	info("$(img_w*img_h - length(decoded.data)) pixels were missing")
 	img_decoded = Image(decoded.data)
@@ -590,8 +561,8 @@ function testBinaryLaplace()
 	info("Test done")
 end
 
-#testBinaryStatic()
-#testBinaryLaplace()
+testBinaryStatic()
+testBinaryLaplace()
 testGrayscaleStatic()
 
 end
