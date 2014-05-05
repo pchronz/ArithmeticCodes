@@ -27,11 +27,7 @@ type TwoDIterator <: SourceIterator
 	TwoDIterator(w::Uint, h::Uint, done::Bool, overflow::Bool, copy::TwoDIterator) = new(w, h, done, overflow, copy)
 end
 function TwoDIterator(first=false)
-	if first
-		TwoDIterator(uint(1), uint(1), false, false)
-	else
-		TwoDIterator(uint(0), uint(0), false, false)
-	end
+	TwoDIterator(uint(0), uint(0), false, false)
 end
 abstract DataSource
 type TwoDGreyImage <: DataSource
@@ -86,7 +82,7 @@ function encode(alphabet::Vector{Uint8}, src::DataSource, src_it_state::SourceIt
 	encoded::Vector{Char} = Array(Char, 0)
 	# This vector counts the occurences of symbols.
 	lower::Uint32 = uint32(0)
-	upper::Uint32 = uint32(0) - uint32(1)
+	upper::Uint32 = uint32(0) - uint32(2)
 	lower_fl::Float64
 	upper_fl::Float64
 	# XXX Make it generic again.
@@ -101,17 +97,18 @@ function encode(alphabet::Vector{Uint8}, src::DataSource, src_it_state::SourceIt
 	# A counter for the refresh rate of the probability model.
 	refresh_ctr::Int = 0
 	while !src_it_state.done
-		src_it_state = src_it(src, src_it_state)
 		if refresh_ctr % refresh_rate == 0
 			calculateboundaries(intervals, 0, src, src_it_state)
 		end
+		src_it_state = src_it(src, src_it_state)
 		refresh_ctr += 1
 		# XXX Make it generic again.
 		symbol_idx::Int = symbol_idxs[src.data[src_it_state.h, src_it_state.w]]
 		lower_fl = intervals[symbol_idx]
 		upper_fl = intervals[symbol_idx + 1]
+		@assert lower_fl < upper_fl
 		lower, upper = scaleboundaries(lower, upper, lower_fl, upper_fl)
-		assert(lower < upper)
+		@assert lower < upper
 
 		overlaplength = calculateoverlap(lower, upper)
 		
@@ -121,7 +118,7 @@ function encode(alphabet::Vector{Uint8}, src::DataSource, src_it_state::SourceIt
 		# shift the boundaries to remove the written bits
 		lower = lower << overlaplength
 		upper = upper << overlaplength
-		assert(lower < upper)
+		@assert lower < upper
 
 		# DEBUG
 		push!(lower_enc, lower)
@@ -158,11 +155,11 @@ function encode(alphabet::Vector{Uint8}, src::DataSource, src_it_state::SourceIt
 	# The second 0 after the overlap.
 	zeropos = search(bits(lower), '0', overlaplength + 2)
 	zeropos = search(bits(lower), '0', zeropos + 1)
-	assert(zeropos > overlaplength)
+	@assert zeropos > overlaplength
 	# write out the overlapping bits
 	lowerend::Uint32 = lower + (uint32(1) << (32 - zeropos))
-	assert(lowerend > lower)
-	assert(lowerend + (uint(1) << (32 - zeropos)) - 1 <= upper)
+	@assert lowerend > lower
+	@assert lowerend + (uint(1) << (32 - zeropos)) - 1 <= upper
 	append!(encoded, collect(bits(lowerend)[1:zeropos]))
 
 	encoded
@@ -194,8 +191,8 @@ function decode!(encoded::Vector{Char}, alphabet::Vector{Uint8}, src::DataSource
 	# Pointer to the current position in the interval window string
 	pos::Int = 0
 	# Lower and upper boundaries for the symbols.
-	lower::Uint32 = 0
-	upper::Uint32 = 0 - 1
+	lower::Uint32 = uint32(0)
+	upper::Uint32 = uint32(0) - uint32(2)
 	# The counter for the refresh rate for the probability model.
 	refresh_ctr::Int = 0
 	# Allocate the intervals vector, to allow for binary search.
@@ -214,7 +211,6 @@ function decode!(encoded::Vector{Char}, alphabet::Vector{Uint8}, src::DataSource
 		t = uint32(tc) - 48
 		# Push the codeword symbol into the window
 		window = window | (t << (32 - pos))
-
 		# Decode all source symbols using the codeword interval.
 		lower, upper, window, pos, refresh_ctr = decodewindow!(intervals, alphabet, lower, upper, window, 
 			pos, src, src_it_state, src_it, calculateboundaries, refresh_ctr, refresh_rate)
@@ -251,15 +247,16 @@ function decodewindow!(intervals::Vector{Float64}, alphabet::Vector{Uint8}, lowe
 				symbol_progress = idx
 			else
 				calculateboundaries(intervals, symbol_progress, src, src_it_state.copy, idx)
-				symbol_progress = max(idx, symbol_progress)
+				symbol_progress = maximum(idx, symbol_progress)
 			end
 
 			low::Uint32
 			up::Uint32
 			low_fl::Float64 = intervals[idx]
 			up_fl::Float64 = intervals[idx + 1]
-			assert(low_fl < up_fl)
-			assert(window_fl < wintop_fl)
+
+			@assert low_fl < up_fl
+			@assert window_fl < wintop_fl
 			# There are five cases to test for binary search:
 			# 1 The symbol interval matches the window. --> we're done here.
 			# 3 The symbol interval crosses the upper boundary. --> fail.
@@ -278,8 +275,6 @@ function decodewindow!(intervals::Vector{Float64}, alphabet::Vector{Uint8}, lowe
 				# and you need to increment the iterator, update
 				# the boundaries, and shift both.
 
-				pushsymbol!(src, src_it_state, alphabet[idx])
-
 				# Increment the iterator.
 				if refresh_ctr % refresh_rate == 0
 					src_it_state = src_it(src, src_it_state, true)
@@ -288,7 +283,11 @@ function decodewindow!(intervals::Vector{Float64}, alphabet::Vector{Uint8}, lowe
 				end
 				refresh_ctr += 1
 
+				pushsymbol!(src, src_it_state, alphabet[idx])
+
 				low, up = scaleboundaries(lower, upper, low_fl, up_fl)
+				@assert window >= low
+				@assert windowtop <= up
 
 				# Shift the boundaries.
 				# Identify the identical bits and shift them out.
@@ -307,10 +306,10 @@ function decodewindow!(intervals::Vector{Float64}, alphabet::Vector{Uint8}, lowe
 				push!(lower_dec, low)
 				push!(upper_dec, up)
 
-				assert(low < up)
-				assert(window >= low)
-				assert(window <= up)
-				assert(pos >= 0)
+				@assert low < up
+				@assert window >= low
+				@assert window <= up
+				@assert pos >= 0
 
 				# Update the boundaries.
 				lower = low
@@ -354,10 +353,10 @@ end
 function scaleboundaries(lower::Uint32, upper::Uint32, low::Float64, 
 	up::Float64)
 	# scale the boundaries
-	p::Uint32 = upper - lower
-	upper::Uint32 = uint32(lower) + uint32(round((float64(p) + 1.0)*float64(up))) - uint32(1)
-	lower::Uint32 = uint32(lower) + uint32(round((float64(p) + 1.0)*float64(low)))
-	lower, upper
+	p::Uint32 = upper - lower + 1
+	uppr::Uint32 = uint32(lower) + uint32(round((float64(p) + 1.0)*float64(up))) - uint32(1)
+	lowr::Uint32 = uint32(lower) + uint32(round((float64(p) + 1.0)*float64(low)))
+	lowr, uppr
 end
 
 # Static probability model for grayscale images.
@@ -373,11 +372,41 @@ function calculateboundariesgraystatic(intervals::Vector{Float64}, progress::Int
 	num_pixels = prod(size(src.data))
 	p_EOF = 1.0/(num_pixels + 1)
 	p_delta = 1.0/256.0 * (1.0 - p_EOF)
-	assert(p_delta*256 == 1.0 - p_EOF)
+	@assert p_delta*256 == 1.0 - p_EOF
 
 	intervals[1] = 0.0
 	for i = (progress + 1):upper_idx
 		intervals[i + 1] = intervals[i] + p_delta
+	end
+	intervals[end] = 1.0
+end
+
+# Generalised rule of succession probability model for grayscale images.
+# Given the observed values in src up to the iterator compute the probabilites on the alphabet up to the upper idx symbol.
+function calculateboundariesgraysuccession(intervals::Vector{Float64}, progress::Int, src::DataSource, it_state::SourceIterator, upper_idx::Int=0)
+	if upper_idx == 0 || upper_idx == 257
+		upper_idx = 256
+	end
+	if progress == upper_idx
+		return 
+	end
+
+	num_pixels = prod(size(src.data))
+	p_EOF = 1.0/(num_pixels + 1)
+
+	# Count the number of occurences
+	# XXX Performance: Don't re-allocate and recompute all of this each time.
+	occurence_ctr::Vector{Uint} = zeros(Uint, 256)
+	for h = 1:it_state.h, w = 1:size(src.data, 2)
+		occurence_ctr[src.data[h, w] + 1] += 1
+		if h == it_state.h && w == it_state.w
+			break
+		end
+	end
+
+	intervals[1] = 0.0
+	for i = (progress + 1):upper_idx
+		intervals[i + 1] = intervals[i] + (1 - p_EOF)*(occurence_ctr[i] + 1)/(sum(occurence_ctr) + 256)
 	end
 	intervals[end] = 1.0
 end
@@ -393,8 +422,6 @@ function calculateboundariesstatic(intervals::Vector{Float64}, progress::Int, sr
 	intervals[2] = p_lo
 	intervals[3] = p_hi
 	intervals[4] = 1.0
-
-	intervals
 end
 
 # Laplace's rule of succession as adaptive probability model.
@@ -404,11 +431,17 @@ function calculateboundarieslaplace(intervals::Vector{Float64}, progress::Int, s
 	num_pixels = prod(size(src.data))
 	p_EOF = 1.0/float64(num_pixels + 1)
 
+	# XXX Want this function to run faster? Re-implement using a for-loop.
 	# Linearize all elements up to the iterator.
 	src_lin::Vector{Uint8} = reshape(src.data[1:it_state.h, :]', 
 		int64(it_state.h * img_w), 1)[:, 1]
 	# Sum up the occurences up to the iterator.
-	num_covered = (it_state.h - 1)*img_w + it_state.w - 1
+	num_covered::Int
+	if it_state.h == 0
+		num_covered = 0
+	else
+		num_covered = (it_state.h - 1)*img_w + it_state.w
+	end
 	# Sum and normalize the values.
 	# XXX This summation dominates the execution time. Save the state 
 		# somewhere and compute the values progressively.
@@ -428,18 +461,74 @@ img_h = 100
 
 EOF = "EOF"
 
-function testGrayscaleStatic()
-	info("Testing the static model on a binary image.")
+function testgrayscalesuccession()
+	info("Testing the succession model on a grayscale image.")
 	# DEBUG
 	global lower_enc = Array(Uint32, 0)
 	global upper_enc = Array(Uint32, 0)
 	global lower_dec = Array(Uint32, 0)
 	global upper_dec = Array(Uint32, 0)
 
-	img_64::Vector{Int} = rand(DiscreteUniform(0, 255), img_h*img_w)
+	#img_64::Vector{Int} = rand(DiscreteUniform(0, 255), img_h*img_w)
 	#img_64::Vector{Int} = rand(Binomial(255, 0.5), img_h*img_w)
+	img_64::Vector{Int} = 2ones(Int, img_h*img_w)
 	img_8::Vector{Uint8} = map((x)->uint8(x), img_64)
 	img = Image(reshape(img_8, img_h, img_w))
+	#f = open("/Users/pchronz/Desktop/114.txt")
+	#img_data = deserialize(f)
+	#close(f)
+	#img = Image(img)
+	ImageView.display(img)
+
+	refresh_rate::Int = 1
+
+	tic()
+	# Static probabilistic model.
+	encoded = encode(Uint8[0:255], TwoDGreyImage(img.data), TwoDIterator(), hor2diterator,
+		calculateboundariesgraysuccession, refresh_rate)
+	toc()
+	info("Encoded length: $(length(encoded))")
+
+	tic()
+	# Static probabilistic model.
+	#Profile.clear()
+	decoded = TwoDGreyImage(zeros(Uint8, size(img.data)))
+	decode!(encoded, Uint8[0:255], decoded, TwoDIterator(true),
+		hor2diterator, calculateboundariesgraysuccession, refresh_rate)
+	#Profile.print()
+	toc()
+	info("$(img_w*img_h - length(decoded.data)) pixels were missing")
+	img_decoded = Image(decoded.data)
+	ImageView.display(img_decoded)
+
+	# DEBUG
+	lower_comp = lower_enc[1:end - (length(lower_enc) - 
+		length(lower_dec))] .- lower_dec
+	upper_comp = upper_enc[1:end - (length(upper_enc) - 
+		length(upper_dec))] .- upper_dec
+	@assert sum(lower_comp) + sum(upper_comp) == 0
+
+	@assert img.data == img_decoded.data
+	info("Test done")
+end
+
+function testGrayscaleStatic()
+	info("Testing the static model on a grayscale image.")
+	# DEBUG
+	global lower_enc = Array(Uint32, 0)
+	global upper_enc = Array(Uint32, 0)
+	global lower_dec = Array(Uint32, 0)
+	global upper_dec = Array(Uint32, 0)
+
+	#img_64::Vector{Int} = rand(DiscreteUniform(0, 255), img_h*img_w)
+	#img_64::Vector{Int} = rand(Binomial(255, 0.5), img_h*img_w)
+	img_64::Vector{Int} = 2ones(Int, img_h*img_w)
+	img_8::Vector{Uint8} = map((x)->uint8(x), img_64)
+	img = Image(reshape(img_8, img_h, img_w))
+	#f = open("/Users/pchronz/Desktop/114.txt")
+	#img_data = deserialize(f)
+	#close(f)
+	#img = Image(img)
 	ImageView.display(img)
 
 	refresh_rate::Int = 1
@@ -468,9 +557,9 @@ function testGrayscaleStatic()
 		length(lower_dec))] .- lower_dec
 	upper_comp = upper_enc[1:end - (length(upper_enc) - 
 		length(upper_dec))] .- upper_dec
-	assert(sum(lower_comp) + sum(upper_comp) == 0)
+	@assert sum(lower_comp) + sum(upper_comp) == 0
 
-	assert(img.data == img_decoded.data)
+	@assert img.data == img_decoded.data
 	info("Test done")
 end
 
@@ -513,9 +602,9 @@ function testBinaryStatic()
 		length(lower_dec))] .- lower_dec
 	upper_comp = upper_enc[1:end - (length(upper_enc) - 
 		length(upper_dec))] .- upper_dec
-	assert(sum(lower_comp) + sum(upper_comp) == 0)
+	@assert sum(lower_comp) + sum(upper_comp) == 0
 
-	assert(img.data == img_decoded.data)
+	@assert img.data == img_decoded.data
 	info("Test done")
 end
 
@@ -555,15 +644,16 @@ function testBinaryLaplace()
 		length(lower_dec))] .- lower_dec
 	upper_comp = upper_enc[1:end - (length(upper_enc) - 
 		length(upper_dec))] .- upper_dec
-	assert(sum(lower_comp) + sum(upper_comp) == 0)
+	@assert sum(lower_comp) + sum(upper_comp) == 0
 
-	assert(img.data == img_decoded.data)
+	@assert img.data == img_decoded.data
 	info("Test done")
 end
 
 testBinaryStatic()
 testBinaryLaplace()
 testGrayscaleStatic()
+testgrayscalesuccession()
 
 end
 
