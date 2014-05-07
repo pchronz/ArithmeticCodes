@@ -1,10 +1,6 @@
-# TODO Use binary search on intervals.
-# TODO Only compute the necessary values in the interval. When going linearly,
-	# compute one by one. When using binary search, compute half by half.
+# TODO Implement adaptive precision.
+# TODO Improve performance of both succession models.
 # TODO Make encoding and decoding independent of the type of symbol again.
-# TODO Sub-sample recomputation of intervals.
-# TODO There are errors on some images. Randomize the sources, save them, and 
-	# identify and solve the problem.
 # TODO Use generic functions to be flexible with the source alphabet.
 # TODO Tests
 # TODO Decode based on Vector{Uint8, 1} instead of Chars with binary symbols.
@@ -76,6 +72,7 @@ function pushsymbol!(src::TwoDGreyImage, src_it::TwoDIterator, sym::Uint8)
 end
 
 # encode the image pixel by pixel
+oll_enc = Array(Int, 0)
 function encode(alphabet::Vector{Uint8}, src::DataSource, src_it_state::SourceIterator, src_it::Function,
 	 calculateboundaries::Function, refresh_rate::Int)
 	# Encoded vector
@@ -111,6 +108,8 @@ function encode(alphabet::Vector{Uint8}, src::DataSource, src_it_state::SourceIt
 		@assert lower < upper
 
 		overlaplength = calculateoverlap(lower, upper)
+		# DEBUG
+		push!(oll_enc, overlaplength)
 		
 		# write out the overlapping bits
 		append!(encoded, collect(bits(lower)[1:overlaplength]))
@@ -218,6 +217,7 @@ function decode!(encoded::Vector{Char}, alphabet::Vector{Uint8}, src::DataSource
 	src
 end
 
+oll_dec = Array(Int, 0)
 function decodewindow!(intervals::Vector{Float64}, alphabet::Vector{Uint8}, lower::Uint32, upper::Uint32, window::Uint32, pos::Int,
 	src::DataSource, src_it_state::SourceIterator, 
 	src_it::Function, calculateboundaries::Function, refresh_ctr::Int, refresh_rate::Int)
@@ -256,6 +256,14 @@ function decodewindow!(intervals::Vector{Float64}, alphabet::Vector{Uint8}, lowe
 			up_fl::Float64 = intervals[idx + 1]
 
 			@assert low_fl < up_fl
+			if window_fl >= wintop_fl
+				info("window ->    $(window)")
+				info("windowtop -> $(windowtop)")
+				info("pos -> $(pos)")
+				println(oll_enc')
+				println(oll_dec')
+				info("$(sum(oll_enc' - oll_dec'))")
+			end
 			@assert window_fl < wintop_fl
 			# There are five cases to test for binary search:
 			# 1 The symbol interval matches the window. --> we're done here.
@@ -286,12 +294,41 @@ function decodewindow!(intervals::Vector{Float64}, alphabet::Vector{Uint8}, lowe
 				pushsymbol!(src, src_it_state, alphabet[idx])
 
 				low, up = scaleboundaries(lower, upper, low_fl, up_fl)
+				if window < low
+					warn("up        -> $(up)")
+					warn("window    -> $(window)")
+					warn("low       -> $(low)")
+					warn("up_fl     -> $(up_fl)")
+					warn("window_fl -> $(window_fl)")
+					warn("low_fl    -> $(low_fl)")
+					warn("lower     -> $(lower)")
+					warn("window    -> $(window)")
+					warn("upper     -> $(upper)")
+					push!(lower_dec, low)
+					push!(upper_dec, up)
+					warn("overlaplength = calculateoverlap(low, up) -> $(overlaplength = calculateoverlap(low, up))")
+					lower_comp = lower_enc[1:end - (length(lower_enc) - 
+						length(lower_dec))] .- lower_dec
+					upper_comp = upper_enc[1:end - (length(upper_enc) - 
+						length(upper_dec))] .- upper_dec
+					warn("$(sum(lower_comp) + sum(upper_comp))")
+					warn("log2(upper - lower) -> $(log2(upper - lower))")
+					warn("log2(up - low) -> $(log2(up - low))")
+					windough, updough = scaleboundaries(lower, upper, window_fl, up_fl)
+					warn("window   -> $(window)")
+					warn("windough -> $(windough)")
+					warn("low      -> $(low)")
+				end
 				@assert window >= low
 				@assert windowtop <= up
 
 				# Shift the boundaries.
 				# Identify the identical bits and shift them out.
 				overlaplength = calculateoverlap(low, up)
+
+				# DEBUG
+				push!(oll_dec, overlaplength)
+
 				# Shift the boundaries to remove the written bits
 				low = low << overlaplength
 				up = up << overlaplength
@@ -341,8 +378,8 @@ function decodewindow!(intervals::Vector{Float64}, alphabet::Vector{Uint8}, lowe
 			else
 				info("window_fl -> $(window_fl)")
 				info("wintop_fl -> $(wintop_fl)")
-				info("low_fl -> $(low_fl)")
-				info("up_fl -> $(up_fl)")
+				info("low_fl ->    $(low_fl)")
+				info("up_fl ->     $(up_fl)")
 				error("Reached an impossible state during binary search.")
 			end
 		end
@@ -354,8 +391,8 @@ function scaleboundaries(lower::Uint32, upper::Uint32, low::Float64,
 	up::Float64)
 	# scale the boundaries
 	p::Uint32 = upper - lower + 1
-	uppr::Uint32 = uint32(lower) + uint32(round((float64(p) + 1.0)*float64(up))) - uint32(1)
-	lowr::Uint32 = uint32(lower) + uint32(round((float64(p) + 1.0)*float64(low)))
+	uppr::Uint32 = uint32(lower) + uint32(floor(float64(p)*float64(up))) - uint32(1)
+	lowr::Uint32 = uint32(lower) + uint32(floor(float64(p)*float64(low)))
 	lowr, uppr
 end
 
@@ -456,7 +493,7 @@ function calculateboundarieslaplace(intervals::Vector{Float64}, progress::Int, s
 end
 
 # Test it.
-img_w = 1000
+img_w = 100
 img_h = 100
 
 EOF = "EOF"
@@ -469,16 +506,16 @@ function testgrayscalesuccession()
 	global lower_dec = Array(Uint32, 0)
 	global upper_dec = Array(Uint32, 0)
 
-	#img_64::Vector{Int} = rand(DiscreteUniform(0, 255), img_h*img_w)
-	#img_64::Vector{Int} = rand(Binomial(255, 0.5), img_h*img_w)
-	img_64::Vector{Int} = 2ones(Int, img_h*img_w)
+	img_64::Vector{Int} = rand(DiscreteUniform(0, 255), img_h*img_w)
+	#img_64::Vector{Int} = rand(Binomial(255, 0.99), img_h*img_w)
+	#img_64::Vector{Int} = 2ones(Int, img_h*img_w)
 	img_8::Vector{Uint8} = map((x)->uint8(x), img_64)
 	img = Image(reshape(img_8, img_h, img_w))
-	#f = open("/Users/pchronz/Desktop/114.txt")
-	#img_data = deserialize(f)
+	#f = open("windowless")
+	#img = deserialize(f)
 	#close(f)
 	#img = Image(img)
-	ImageView.display(img)
+	ImageView.display(img.data)
 
 	refresh_rate::Int = 1
 
@@ -521,8 +558,8 @@ function testGrayscaleStatic()
 	global upper_dec = Array(Uint32, 0)
 
 	#img_64::Vector{Int} = rand(DiscreteUniform(0, 255), img_h*img_w)
-	#img_64::Vector{Int} = rand(Binomial(255, 0.5), img_h*img_w)
-	img_64::Vector{Int} = 2ones(Int, img_h*img_w)
+	img_64::Vector{Int} = rand(Binomial(255, 0.5), img_h*img_w)
+	#img_64::Vector{Int} = 2ones(Int, img_h*img_w)
 	img_8::Vector{Uint8} = map((x)->uint8(x), img_64)
 	img = Image(reshape(img_8, img_h, img_w))
 	#f = open("/Users/pchronz/Desktop/114.txt")
