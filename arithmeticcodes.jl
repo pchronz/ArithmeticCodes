@@ -1,4 +1,7 @@
-# TODO Implement adaptive precision.
+# XXX Deal with potential encoding problems due to limited precision.
+# TODO Implement arbitrary precision encoding.
+# TODO Implement adaptive arbitrary precision encoding.
+# TODO Separate source generation and encoding call. 
 # TODO Improve performance of both succession models.
 # TODO Make encoding and decoding independent of the type of symbol again.
 # TODO Use generic functions to be flexible with the source alphabet.
@@ -7,10 +10,11 @@
 # TODO Avoid copying where it is not necessary and use subarrays instead.
 # TODO Extend function names that manipulate parameters with an exclamation mark
 
-module arithmo4astro
+module arithmeticcodes
+
+using Distributions
 using Images
 using ImageView
-using Distributions
 
 abstract SourceIterator
 type TwoDIterator <: SourceIterator
@@ -25,13 +29,16 @@ end
 function TwoDIterator(first=false)
 	TwoDIterator(uint(0), uint(0), false, false)
 end
-abstract DataSource
-type TwoDGreyImage <: DataSource
-	data::Array{Uint8, 2}
-	overflow::Vector{Uint8}
+function TwoDIterator(that::TwoDIterator)
+	TwoDIterator(that.w, that.h, that.done, that.overflow)
 end
-function TwoDGreyImage(data::Array{Uint8, 2})
-	TwoDGreyImage(data, Array(Uint8, 0))
+abstract DataSource{T}
+type TwoDGreyImage{T} <: DataSource{T}
+	data::Array{T, 2}
+	overflow::Vector{T}
+end
+function TwoDGreyImage{T}(data::Array{T, 2})
+	TwoDGreyImage(data, Array(T, 0))
 end
 function hor2diterator(src::TwoDGreyImage, iterator::TwoDIterator, holdcopy::Bool = false)
 	if iterator.done
@@ -63,7 +70,7 @@ function hor2diterator(src::TwoDGreyImage, iterator::TwoDIterator, holdcopy::Boo
 		return iterator
 	end
 end
-function pushsymbol!(src::TwoDGreyImage, src_it::TwoDIterator, sym::Uint8)
+function pushsymbol!{T}(src::TwoDGreyImage, src_it::TwoDIterator, sym::T)
 	if !src_it.overflow
 		src.data[src_it.h, src_it.w] = sym
 	else
@@ -71,10 +78,18 @@ function pushsymbol!(src::TwoDGreyImage, src_it::TwoDIterator, sym::Uint8)
 	end
 end
 
+function init(t::Type)
+	global occurence_ctr
+	occurence_ctr = zeros(Uint, typemax(t) + 1)
+end
+
 # encode the image pixel by pixel
+# DEBUG
 oll_enc = Array(Int, 0)
-function encode(alphabet::Vector{Uint8}, src::DataSource, src_it_state::SourceIterator, src_it::Function,
+function encode{T}(alphabet::Vector{T}, src::DataSource, src_it_state::SourceIterator, src_it::Function,
 	 calculateboundaries::Function, refresh_rate::Int)
+	# Init global data structures; for example the structures for the adaptive model.
+	init(T)
 	# Encoded vector
 	encoded::Vector{Char} = Array(Char, 0)
 	# This vector counts the occurences of symbols.
@@ -87,7 +102,7 @@ function encode(alphabet::Vector{Uint8}, src::DataSource, src_it_state::SourceIt
 	# Compute the indices for the symbols.
 	# XXX Will only work numberic alphabets, unless we first transform the alphabet to a numeric alphabet.
 	# XXX What a waste of memory! Consider using a dictionary.
-	symbol_idxs::Dict{Uint8, Int} = Dict{Uint8, Int}()
+	symbol_idxs::Dict{T, Int} = Dict{T, Int}()
 	for (i,s) in enumerate(alphabet)
 		symbol_idxs[s] = i
 	end
@@ -154,6 +169,11 @@ function encode(alphabet::Vector{Uint8}, src::DataSource, src_it_state::SourceIt
 	# The second 0 after the overlap.
 	zeropos = search(bits(lower), '0', overlaplength + 2)
 	zeropos = search(bits(lower), '0', zeropos + 1)
+	if zeropos > overlaplength
+		f = open("badend", "w")
+		serialize(f, src.data)
+		close(f)
+	end
 	@assert zeropos > overlaplength
 	# write out the overlapping bits
 	lowerend::Uint32 = lower + (uint32(1) << (32 - zeropos))
@@ -181,9 +201,11 @@ function calculateoverlap(lower::Uint32, upper::Uint32)
 	pos - 1
 end
 
-function decode!(encoded::Vector{Char}, alphabet::Vector{Uint8}, src::DataSource, 
+function decode!{T}(encoded::Vector{Char}, alphabet::Vector{T}, src::DataSource, 
 	src_it_state::SourceIterator, src_it::Function, 
 	calculateboundaries::Function, refresh_rate::Int)
+	# Init global data structures; for example the structures for the adaptive model.
+	init(T)
 	# Window that holds the open code symbols, until a new source symbol 
 		#is identified.
 	window::Uint32 = 0
@@ -217,8 +239,9 @@ function decode!(encoded::Vector{Char}, alphabet::Vector{Uint8}, src::DataSource
 	src
 end
 
+# DEBUG
 oll_dec = Array(Int, 0)
-function decodewindow!(intervals::Vector{Float64}, alphabet::Vector{Uint8}, lower::Uint32, upper::Uint32, window::Uint32, pos::Int,
+function decodewindow!{T}(intervals::Vector{Float64}, alphabet::Vector{T}, lower::Uint32, upper::Uint32, window::Uint32, pos::Int,
 	src::DataSource, src_it_state::SourceIterator, 
 	src_it::Function, calculateboundaries::Function, refresh_ctr::Int, refresh_rate::Int)
 	# The upper boundary of the window interval.
@@ -399,8 +422,10 @@ end
 # Static probability model for grayscale images.
 # Given the observed values in src up to the iterator compute the probabilites on the alphabet up to the upper idx symbol.
 function calculateboundariesgraystatic(intervals::Vector{Float64}, progress::Int, src::DataSource, it_state::SourceIterator, upper_idx::Int=0)
+	t = eltype(src.data)
+	tm = typemax(t)
 	if upper_idx == 0
-		upper_idx = 257
+		upper_idx = tm + 2
 	end
 	if progress == upper_idx
 		return 
@@ -408,8 +433,8 @@ function calculateboundariesgraystatic(intervals::Vector{Float64}, progress::Int
 
 	num_pixels = prod(size(src.data))
 	p_EOF = 1.0/(num_pixels + 1)
-	p_delta = 1.0/256.0 * (1.0 - p_EOF)
-	@assert p_delta*256 == 1.0 - p_EOF
+	p_delta = 1.0/float64(tm + 1) * (1.0 - p_EOF)
+	@assert p_delta*(tm + 1) == 1.0 - p_EOF
 
 	intervals[1] = 0.0
 	for i = (progress + 1):upper_idx
@@ -421,8 +446,10 @@ end
 # Generalised rule of succession probability model for grayscale images.
 # Given the observed values in src up to the iterator compute the probabilites on the alphabet up to the upper idx symbol.
 function calculateboundariesgraysuccession(intervals::Vector{Float64}, progress::Int, src::DataSource, it_state::SourceIterator, upper_idx::Int=0)
-	if upper_idx == 0 || upper_idx == 257
-		upper_idx = 256
+	t = eltype(src.data)
+	tm = typemax(t)
+	if upper_idx == 0 || upper_idx == tm + 2
+		upper_idx = tm + 1
 	end
 	if progress == upper_idx
 		return 
@@ -432,18 +459,26 @@ function calculateboundariesgraysuccession(intervals::Vector{Float64}, progress:
 	p_EOF = 1.0/(num_pixels + 1)
 
 	# Count the number of occurences
-	# XXX Performance: Don't re-allocate and recompute all of this each time.
-	occurence_ctr::Vector{Uint} = zeros(Uint, 256)
-	for h = 1:it_state.h, w = 1:size(src.data, 2)
-		occurence_ctr[src.data[h, w] + 1] += 1
-		if h == it_state.h && w == it_state.w
-			break
+	global occurence_ctr
+	if it_state.h == 0 && it_state.w == 0
+		global last_state
+		last_state = TwoDIterator()
+	end
+	if !(it_state.h == last_state.h && it_state.w == last_state.w)
+		hor2diterator(src, last_state)
+		for h = last_state.h:it_state.h, w = last_state.w:size(src.data, 2)
+			occurence_ctr[src.data[h, w] + 1] += 1
+			if h == it_state.h && w == it_state.w
+				break
+			end
 		end
+		last_state = TwoDIterator(it_state)
 	end
 
 	intervals[1] = 0.0
+	sum_occ = sum(occurence_ctr)
 	for i = (progress + 1):upper_idx
-		intervals[i + 1] = intervals[i] + (1 - p_EOF)*(occurence_ctr[i] + 1)/(sum(occurence_ctr) + 256)
+		intervals[i + 1] = intervals[i] + (1 - p_EOF)*(occurence_ctr[i] + 1)/(sum_occ + tm + 1)
 	end
 	intervals[end] = 1.0
 end
@@ -463,6 +498,7 @@ end
 
 # Laplace's rule of succession as adaptive probability model.
 function calculateboundarieslaplace(intervals::Vector{Float64}, progress::Int, src::DataSource, it_state::SourceIterator, upper_idx::Int=0)
+	t = eltype(src.data)
 	img_w = size(src.data)[2]
 
 	num_pixels = prod(size(src.data))
@@ -470,7 +506,7 @@ function calculateboundarieslaplace(intervals::Vector{Float64}, progress::Int, s
 
 	# XXX Want this function to run faster? Re-implement using a for-loop.
 	# Linearize all elements up to the iterator.
-	src_lin::Vector{Uint8} = reshape(src.data[1:it_state.h, :]', 
+	src_lin::Vector{t} = reshape(src.data[1:it_state.h, :]', 
 		int64(it_state.h * img_w), 1)[:, 1]
 	# Sum up the occurences up to the iterator.
 	num_covered::Int
@@ -482,7 +518,7 @@ function calculateboundarieslaplace(intervals::Vector{Float64}, progress::Int, s
 	# Sum and normalize the values.
 	# XXX This summation dominates the execution time. Save the state 
 		# somewhere and compute the values progressively.
-	p_hi = sum(src_lin[1:num_covered]/255)
+	p_hi = sum(src_lin[1:num_covered]/typemax(t))
 	p_hi = (p_hi + 1)/(num_covered + 2)*(1.0 - p_EOF)
 	p_lo = (1.0 - p_EOF) - p_hi
 
@@ -492,25 +528,48 @@ function calculateboundarieslaplace(intervals::Vector{Float64}, progress::Int, s
 	intervals[4] = 1.0
 end
 
+# DEBUG
+lower_enc = Array(Uint32, 0)
+upper_enc = Array(Uint32, 0)
+lower_dec = Array(Uint32, 0)
+upper_dec = Array(Uint32, 0)
+
+export 
+	encode,
+	decode!,
+	TwoDGreyImage,
+	TwoDIterator,
+	hor2diterator,
+	calculateboundariesgraystatic,
+	calculateboundariesgraysuccession,
+	calculateboundariesstatic,
+	calculateboundarieslaplace, 
+
+	# DEBUG
+	lower_enc,
+	lower_dec,
+	upper_enc,
+	upper_dec
+
 # Test it.
-img_w = 100
-img_h = 100
+img_w = 1000
+img_h = 1000
 
 EOF = "EOF"
 
-function testgrayscalesuccession()
+function testgrayscalesuccession(t::Type)
 	info("Testing the succession model on a grayscale image.")
 	# DEBUG
-	global lower_enc = Array(Uint32, 0)
-	global upper_enc = Array(Uint32, 0)
-	global lower_dec = Array(Uint32, 0)
-	global upper_dec = Array(Uint32, 0)
+	empty!(lower_enc)
+	empty!(upper_enc)
+	empty!(lower_dec)
+	empty!(upper_dec)
 
-	img_64::Vector{Int} = rand(DiscreteUniform(0, 255), img_h*img_w)
-	#img_64::Vector{Int} = rand(Binomial(255, 0.99), img_h*img_w)
+	#img_64::Vector{Int} = rand(DiscreteUniform(0, typemax(t)), img_h*img_w)
+	img_64::Vector{Int} = rand(Binomial(typemax(t), 0.5), img_h*img_w)
 	#img_64::Vector{Int} = 2ones(Int, img_h*img_w)
-	img_8::Vector{Uint8} = map((x)->uint8(x), img_64)
-	img = Image(reshape(img_8, img_h, img_w))
+	img_t::Vector{t} = map((x)->convert(t, x), img_64)
+	img = Image(reshape(img_t, img_h, img_w))
 	#f = open("windowless")
 	#img = deserialize(f)
 	#close(f)
@@ -521,16 +580,15 @@ function testgrayscalesuccession()
 
 	tic()
 	# Static probabilistic model.
-	encoded = encode(Uint8[0:255], TwoDGreyImage(img.data), TwoDIterator(), hor2diterator,
-		calculateboundariesgraysuccession, refresh_rate)
+	encoded = encode(t[0:typemax(t)], TwoDGreyImage(img.data), TwoDIterator(), hor2diterator, calculateboundariesgraysuccession, refresh_rate)
 	toc()
 	info("Encoded length: $(length(encoded))")
 
 	tic()
 	# Static probabilistic model.
 	#Profile.clear()
-	decoded = TwoDGreyImage(zeros(Uint8, size(img.data)))
-	decode!(encoded, Uint8[0:255], decoded, TwoDIterator(true),
+	decoded = TwoDGreyImage(zeros(t, size(img.data)))
+	decode!(encoded, t[0:typemax(t)], decoded, TwoDIterator(true),
 		hor2diterator, calculateboundariesgraysuccession, refresh_rate)
 	#Profile.print()
 	toc()
@@ -552,10 +610,10 @@ end
 function testGrayscaleStatic()
 	info("Testing the static model on a grayscale image.")
 	# DEBUG
-	global lower_enc = Array(Uint32, 0)
-	global upper_enc = Array(Uint32, 0)
-	global lower_dec = Array(Uint32, 0)
-	global upper_dec = Array(Uint32, 0)
+	empty!(lower_enc)
+	empty!(upper_enc)
+	empty!(lower_dec)
+	empty!(upper_dec)
 
 	#img_64::Vector{Int} = rand(DiscreteUniform(0, 255), img_h*img_w)
 	img_64::Vector{Int} = rand(Binomial(255, 0.5), img_h*img_w)
@@ -603,10 +661,10 @@ end
 function testBinaryStatic()
 	info("Testing the static model on a binary image.")
 	# DEBUG
-	global lower_enc = Array(Uint32, 0)
-	global upper_enc = Array(Uint32, 0)
-	global lower_dec = Array(Uint32, 0)
-	global upper_dec = Array(Uint32, 0)
+	empty!(lower_enc)
+	empty!(upper_enc)
+	empty!(lower_dec)
+	empty!(upper_dec)
 
 	img = Image(ones(Uint8, img_w, img_h).*255)
 	img.data[:, 2] = 0
@@ -648,10 +706,10 @@ end
 function testBinaryLaplace()
 	info("Testing the Laplace model on a binary image.")
 	# DEBUG
-	global lower_enc = Array(Uint32, 0)
-	global upper_enc = Array(Uint32, 0)
-	global lower_dec = Array(Uint32, 0)
-	global upper_dec = Array(Uint32, 0)
+	empty!(lower_enc)
+	empty!(upper_enc)
+	empty!(lower_dec)
+	empty!(upper_dec)
 
 	img = Image(ones(Uint8, img_w, img_h).*255)
 	img.data[:, 2] = 0
@@ -687,10 +745,10 @@ function testBinaryLaplace()
 	info("Test done")
 end
 
-testBinaryStatic()
-testBinaryLaplace()
+#testBinaryStatic()
+#testBinaryLaplace()
 testGrayscaleStatic()
-testgrayscalesuccession()
+testgrayscalesuccession(Uint8)
 
 end
 
